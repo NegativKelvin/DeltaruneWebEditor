@@ -11,6 +11,9 @@ const GLSL_KW = new Set(('attribute uniform varying const void float int bool ve
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const TOKEN = /(\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|(@?"(?:[^"\\\n]|\\.)*"?|'(?:[^'\\\n]|\\.)*'?)|(\$[0-9a-fA-F]+|\b\d+(?:\.\d+)?\b)|(#?[A-Za-z_]\w*)(\s*\()?/g;
 
+// One span per line, so that the HTML can be split at '\n' (line highlight) without broken tags.
+const span = (cls, text) => text.split('\n').map((l) => `<span class="${cls}">${esc(l)}</span>`).join('\n');
+
 export function highlight(src, lang = 'gml') {
   const kw = lang === 'glsl' ? GLSL_KW : GML_KW;
   let out = '';
@@ -18,8 +21,8 @@ export function highlight(src, lang = 'gml') {
   src.replace(TOKEN, (m, com, str, num, id, call, at) => {
     out += esc(src.slice(last, at));
     last = at + m.length;
-    if (com) out += `<span class="tok-com">${esc(com)}</span>`;
-    else if (str) out += `<span class="tok-str">${esc(str)}</span>`;
+    if (com) out += span('tok-com', com);
+    else if (str) out += span('tok-str', str);
     else if (num) out += `<span class="tok-num">${num}</span>`;
     else if (id) {
       let cls = '';
