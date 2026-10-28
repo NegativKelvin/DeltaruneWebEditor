@@ -97,6 +97,8 @@ textarea { font-family: var(--mono); }
 .badge { display: inline-block; padding: 0 6px; border-radius: 8px; font-size: 11px; background: var(--panel2); color: var(--dim); border: 1px solid var(--line); }
 .badge.mod { color: var(--accent); border-color: var(--accent); }
 .badge.new { color: var(--ok); border-color: var(--ok); }
+.badge.bad { color: var(--danger); border-color: var(--danger); }
+tr.changed td { background: #10262a; }
 .error-box { margin: 16px; padding: 12px; border: 1px solid var(--danger); color: var(--danger); border-radius: 4px; white-space: pre-wrap; }
 .note { padding: 8px 10px; border-left: 3px solid var(--accent2); background: var(--panel); margin: 8px 0; }
 .warn { border-left-color: var(--accent); }

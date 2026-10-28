@@ -11,16 +11,19 @@ export async function render(main) {
   const s = { game_dir: settings.game_dir || '', utmt_cli: settings.utmt_cli || '' };
   const game = h('input', { type: 'text', value: s.game_dir, style: { width: '100%' }, placeholder: 'C:/Program Files (x86)/Steam/steamapps/common/DELTARUNE' });
   const cli = h('input', { type: 'text', value: s.utmt_cli, style: { width: '100%' }, placeholder: 'C:/tools/UTMT/UndertaleModCli.exe' });
+  const saveDir = h('input', { type: 'text', value: settings.save_dir || '', style: { width: '100%' }, placeholder: settings.save_dir_found || '%LOCALAPPDATA%/DELTARUNE' });
   add(page,
     h('h2', null, 'Setup'),
     h('p', { class: 'dim' }, `Server ${health.version}. Original game files are never changed: edits go to workspace/<chapter>/mod, builds to workspace/<chapter>/build.`),
     h('div', { class: 'card col' },
       h('label', { class: 'field' }, h('span', null, 'Deltarune folder (holds data.win and chapterN_windows)'), game),
       h('label', { class: 'field' }, h('span', null, 'UndertaleModCli executable (0.9.2.0 or later)'), cli),
+      h('label', { class: 'field' }, h('span', null, `Save folder (filech1_0, ...; for save files and hot reload). ${settings.save_dir_found ? `Found: ${settings.save_dir_found}` : 'Not found yet.'}`), saveDir),
       h('div', null, h('button', { class: 'primary', onclick: async () => {
         const body = {};
         if (game.value.trim()) body.game_dir = game.value.trim();
         if (cli.value.trim()) body.utmt_cli = cli.value.trim();
+        if (saveDir.value.trim()) body.save_dir = saveDir.value.trim();
         if (await attempt(() => api.put('/api/settings', body), 'Settings saved')) {
           await refreshChapters();
           renderChapters();

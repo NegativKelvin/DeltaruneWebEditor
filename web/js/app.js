@@ -24,6 +24,10 @@ const views = {
   battle: () => import('./editors/battle.js'),
   data: () => import('./views/datalists.js'),
   search: () => import('./views/search.js'),
+  flags: () => import('./views/flags.js'),
+  saves: () => import('./views/saves.js'),
+  live: () => import('./views/live.js'),
+  conflicts: () => import('./views/conflicts.js'),
 };
 
 let dirtyCheck = null;
@@ -111,6 +115,11 @@ function renderNav() {
     h('div', { class: 'nav-head' }, 'Test'),
     navLink(`${c}/preview`, 'Room preview'),
     navLink(`${c}/battle`, 'Bullet patterns and battle box'),
+    h('div', { class: 'nav-head' }, 'Game state'),
+    navLink(`${c}/flags`, 'Flags and variables'),
+    navLink(`${c}/saves`, 'Save files'),
+    navLink(`${c}/live`, 'Hot reload'),
+    navLink(`${c}/conflicts`, 'Mod conflicts'),
     h('div', { class: 'nav-head' }, 'All assets'),
     Object.entries(ASSET_LABELS).map(([slug, label]) => navLink(`${c}/assets/${slug}`, label, state.counts[slug])),
     h('div', { class: 'nav-head' }, 'Tools'),

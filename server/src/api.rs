@@ -16,13 +16,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chapters::{self, Chapter};
+use crate::conflicts;
 use crate::cutscene;
 use crate::dialogue::{self, DialogueLine};
 use crate::enemies;
 use crate::error::{Error, Result};
+use crate::flags;
 use crate::gml;
 use crate::jobs::Jobs;
+use crate::live;
 use crate::patterns::{self, Pattern, PatternStore};
+use crate::saves::{self, Saves};
 use crate::store::{self, ASSET_TYPES, ChapterStore};
 use crate::utmt::Utmt;
 
@@ -32,6 +36,9 @@ pub struct Settings {
     pub game_dir: Option<PathBuf>,
     /// Path to the UndertaleModCli executable.
     pub utmt_cli: Option<PathBuf>,
+    /// Game save folder (holds `filech1_0`, ...). Found automatically when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_dir: Option<PathBuf>,
 }
 
 pub struct AppState {
@@ -41,6 +48,9 @@ pub struct AppState {
     dialogue_cache: Mutex<HashMap<String, Arc<Vec<DialogueLine>>>>,
     cutscene_cache: Mutex<HashMap<String, Arc<CutsceneList>>>,
     enemy_cache: Mutex<HashMap<String, Arc<Vec<enemies::Record>>>>,
+    flag_cache: Mutex<HashMap<String, Arc<Vec<flags::Ref>>>>,
+    /// Hot reload commands not acknowledged by the game yet.
+    live: Mutex<live::Queue>,
     /// Goes up on each invalidate, so an index that was built from older files is not kept.
     epoch: AtomicU64,
     /// Chapter dir -> lang files (read again when a file changes).
@@ -77,6 +87,8 @@ impl AppState {
             dialogue_cache: Mutex::default(),
             cutscene_cache: Mutex::default(),
             enemy_cache: Mutex::default(),
+            flag_cache: Mutex::default(),
+            live: Mutex::default(),
             epoch: AtomicU64::new(0),
             lang_cache: Mutex::default(),
             write_lock: Mutex::default(),
@@ -146,6 +158,33 @@ impl AppState {
         self.dialogue_cache.lock().unwrap().remove(chapter);
         self.cutscene_cache.lock().unwrap().remove(chapter);
         self.enemy_cache.lock().unwrap().remove(chapter);
+        self.flag_cache.lock().unwrap().remove(chapter);
+    }
+
+    /// Game save folder: the setting, else the usual place for the platform.
+    fn save_dir(&self) -> Result<PathBuf> {
+        let s = self.settings.read().unwrap();
+        s.save_dir
+            .clone()
+            .or_else(|| saves::default_dir(s.game_dir.as_deref()))
+            .ok_or_else(|| Error::Conflict("save_dir is not set and the Deltarune save folder was not found".into()))
+    }
+
+    fn saves(&self) -> Result<Saves> {
+        Ok(Saves::new(self.save_dir()?, &self.workspace))
+    }
+
+    fn live_dir(&self) -> Result<PathBuf> {
+        Ok(self.save_dir()?.join(live::DIR))
+    }
+
+    fn flag_refs(&self, chapter: &str, store: &ChapterStore) -> Arc<Vec<flags::Ref>> {
+        cached(&self.flag_cache, &self.epoch, chapter, || {
+            store
+                .code_sources()
+                .flat_map(|(name, src)| flags::scan_source(&name, &src))
+                .collect()
+        })
     }
 
     /// `lang/*.json` of a chapter dir, from the cache while no file changed.
@@ -216,12 +255,34 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/chapters/{ch}/patterns/{name}/gml", post(pattern_gml))
         .route("/api/chapters/{ch}/patterns/{name}/install", post(install_pattern))
+        .route("/api/chapters/{ch}/flags", get(list_flags))
+        .route("/api/chapters/{ch}/flags/refs", get(flag_refs))
+        .route("/api/chapters/{ch}/flag-notes", get(get_flag_notes).put(put_flag_notes))
+        .route("/api/chapters/{ch}/save-layout", get(save_layout))
+        .route("/api/saves", get(list_saves))
+        .route("/api/saves/{file}", get(read_save).put(write_save))
+        .route("/api/saves/{file}/copy", post(copy_save))
+        .route("/api/saves/{file}/load", post(load_save))
+        .route("/api/save-copies/{name}", axum::routing::delete(delete_save_copy))
+        .route("/api/live", get(live_status))
+        .route("/api/live/commands", post(live_commands))
+        .route("/api/live/sprite/{name}", post(live_sprite))
+        .route("/api/live/flags", get(live_flags))
+        .route(
+            "/api/chapters/{ch}/live",
+            get(live_install_status).post(live_install).delete(live_uninstall),
+        )
+        .route("/api/chapters/{ch}/mods", get(list_mods))
+        .route("/api/chapters/{ch}/conflicts", post(check_conflicts))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
 
-async fn get_settings(State(s): St) -> Json<Settings> {
-    Json(s.settings.read().unwrap().clone())
+async fn get_settings(State(s): St) -> Json<Value> {
+    let mut v = json!(s.settings.read().unwrap().clone());
+    // The folder that is used when save_dir is not set.
+    v["save_dir_found"] = json!(s.save_dir().ok());
+    Json(v)
 }
 
 async fn put_settings(State(s): St, Json(new): Json<Settings>) -> Result<Json<Settings>> {
@@ -229,6 +290,11 @@ async fn put_settings(State(s): St, Json(new): Json<Settings>) -> Result<Json<Se
         && !d.is_dir()
     {
         return Err(Error::BadRequest(format!("game_dir '{}' is not a directory", d.display())));
+    }
+    if let Some(d) = &new.save_dir
+        && !d.is_dir()
+    {
+        return Err(Error::BadRequest(format!("save_dir '{}' is not a directory", d.display())));
     }
     if let Some(c) = &new.utmt_cli
         && !c.is_file()
@@ -251,6 +317,9 @@ async fn put_settings(State(s): St, Json(new): Json<Settings>) -> Result<Json<Se
         }
         if new.utmt_cli.is_some() {
             cur.utmt_cli = new.utmt_cli;
+        }
+        if new.save_dir.is_some() {
+            cur.save_dir = new.save_dir;
         }
         cur.clone()
     };
@@ -684,6 +753,298 @@ async fn install_pattern(State(s): St, Path((ch, name)): Path<(String, String)>,
     .await?;
     s.invalidate(&ch);
     Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct FlagQuery {
+    q: Option<String>,
+    name: Option<String>,
+    index: Option<String>,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+/// Global variables with read and write counts. `name` gives one variable, `q` a part of the name.
+async fn list_flags(State(s): St, Path(ch): Path<String>, Query(q): Query<FlagQuery>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let st = s.clone();
+    blocking(move || {
+        let refs = st.flag_refs(&ch, &store);
+        let needle = q.q.map(|x| x.to_lowercase());
+        let all: Vec<flags::Summary> = flags::summarize(&refs)
+            .into_iter()
+            .filter(|x| q.name.as_ref().is_none_or(|n| &x.name == n))
+            .filter(|x| needle.as_ref().is_none_or(|n| x.name.to_lowercase().contains(n)))
+            .collect();
+        let total = all.len();
+        let items: Vec<_> = all.into_iter().skip(q.offset).take(q.limit.unwrap_or(1000)).collect();
+        Ok(Json(json!({ "total": total, "offset": q.offset, "items": items })))
+    })
+    .await
+}
+
+/// Every read and write of one variable (`index` omitted: the plain variable).
+async fn flag_refs(State(s): St, Path(ch): Path<String>, Query(q): Query<FlagQuery>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let name = q.name.ok_or_else(|| Error::BadRequest("name is required".into()))?;
+    let st = s.clone();
+    blocking(move || {
+        let refs = st.flag_refs(&ch, &store);
+        let items: Vec<&flags::Ref> = refs.iter().filter(|r| r.name == name && r.index == q.index).collect();
+        Ok(Json(json!(items)))
+    })
+    .await
+}
+
+fn flag_notes_path(store: &ChapterStore) -> PathBuf {
+    store.root.join("flag-notes.json")
+}
+
+async fn get_flag_notes(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    Ok(Json(
+        std::fs::read(flag_notes_path(&store))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(|| json!({})),
+    ))
+}
+
+/// Body: `{"flag[12]": "met Noelle", ...}`. Kept in `<workspace>/<chapter>/flag-notes.json`.
+async fn put_flag_notes(
+    State(s): St,
+    Path(ch): Path<String>,
+    Json(notes): Json<std::collections::BTreeMap<String, String>>,
+) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let notes: std::collections::BTreeMap<String, String> = notes.into_iter().filter(|(_, v)| !v.trim().is_empty()).collect();
+    std::fs::write(flag_notes_path(&store), serde_json::to_vec_pretty(&notes)?)?;
+    Ok(Json(json!(notes)))
+}
+
+/// Line layout of the save file, from the chapter's save script.
+async fn save_layout(State(s): St, Path(ch): Path<String>) -> Result<Json<flags::SaveLayout>> {
+    let store = s.extracted(&ch)?;
+    blocking(move || {
+        let code = store::asset_type("code")?;
+        let sources = store
+            .list(code)
+            .into_iter()
+            .filter(|e| e.name.contains("scr_saveprocess"))
+            .filter_map(|e| Some((e.name.clone(), store.read(code, &e.name).ok()?["source"].as_str()?.to_owned())))
+            .collect::<Vec<_>>();
+        Ok(Json(flags::save_layout(sources.into_iter())))
+    })
+    .await
+}
+
+async fn list_saves(State(s): St) -> Result<Json<Value>> {
+    let saves = s.saves()?;
+    Ok(Json(json!({ "dir": saves.dir, "files": saves.list()?, "copies": saves.copies() })))
+}
+
+async fn read_save(State(s): St, Path(file): Path<String>) -> Result<Json<saves::SaveText>> {
+    Ok(Json(s.saves()?.read(&file)?))
+}
+
+#[derive(Deserialize)]
+struct SaveBody {
+    lines: Vec<String>,
+}
+
+/// Writes the lines. The old file goes to a backup first.
+async fn write_save(State(s): St, Path(file): Path<String>, Json(b): Json<SaveBody>) -> Result<Json<Value>> {
+    let backup = s.saves()?.write(&file, &b.lines)?;
+    Ok(Json(json!({ "backup": backup })))
+}
+
+#[derive(Deserialize)]
+struct CopyBody {
+    name: String,
+}
+
+async fn copy_save(State(s): St, Path(file): Path<String>, Json(b): Json<CopyBody>) -> Result<StatusCode> {
+    s.saves()?.save_copy(&file, &b.name)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn load_save(State(s): St, Path(file): Path<String>, Json(b): Json<CopyBody>) -> Result<Json<Value>> {
+    let backup = s.saves()?.load_copy(&file, &b.name)?;
+    Ok(Json(json!({ "backup": backup })))
+}
+
+async fn delete_save_copy(State(s): St, Path(name): Path<String>) -> Result<StatusCode> {
+    s.saves()?.delete_copy(&name)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn live_status(State(s): St) -> Result<Json<Value>> {
+    let dir = s.live_dir()?;
+    let ack = live::read_ack(&dir);
+    let q = s.live.lock().unwrap();
+    let acked = ack.as_ref().is_some_and(|a| a.seq == q.seq.to_string());
+    Ok(Json(json!({
+        "dir": dir,
+        "connected": live::connected(ack.as_ref()),
+        "ack": ack,
+        "seq": q.seq,
+        "pending": if acked { 0 } else { q.pending.len() },
+    })))
+}
+
+#[derive(Deserialize)]
+struct LiveBody {
+    commands: Vec<live::Command>,
+}
+
+async fn live_commands(State(s): St, Json(b): Json<LiveBody>) -> Result<Json<Value>> {
+    let dir = s.live_dir()?;
+    let st = s.clone();
+    let seq = blocking(move || st.live.lock().unwrap().send(&dir, b.commands)).await?;
+    Ok(Json(json!({ "seq": seq })))
+}
+
+#[derive(Deserialize)]
+struct SpriteQuery {
+    frames: u32,
+    #[serde(default)]
+    xo: i32,
+    #[serde(default)]
+    yo: i32,
+}
+
+/// Body: PNG strip (frames side by side). Writes it to `dre_live/<name>.png` and sends `sprite_replace`.
+async fn live_sprite(State(s): St, Path(name): Path<String>, Query(q): Query<SpriteQuery>, body: Bytes) -> Result<Json<Value>> {
+    if !body.starts_with(b"\x89PNG") {
+        return Err(Error::BadRequest("body must be a PNG".into()));
+    }
+    let file = format!("{name}.png");
+    let cmd = live::Command {
+        op: "sprite".into(),
+        args: vec![name, file.clone(), q.frames.to_string(), q.xo.to_string(), q.yo.to_string()],
+    };
+    cmd.validate()?;
+    let dir = s.live_dir()?;
+    let st = s.clone();
+    let seq = blocking(move || {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(&file), &body)?;
+        st.live.lock().unwrap().send(&dir, vec![cmd])
+    })
+    .await?;
+    Ok(Json(json!({ "seq": seq })))
+}
+
+async fn live_flags(State(s): St) -> Result<Json<Value>> {
+    let (values, age) = live::read_flags(&s.live_dir()?).ok_or_else(|| Error::NotFound("no flag dump yet; send dumpflags".into()))?;
+    Ok(Json(json!({ "values": values, "age_ms": age })))
+}
+
+async fn live_install_status(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    blocking(move || Ok(Json(live::status(&store)))).await
+}
+
+#[derive(Deserialize, Default)]
+struct InstallBody {
+    host: Option<String>,
+}
+
+async fn live_install(State(s): St, Path(ch): Path<String>, body: Bytes) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let b: InstallBody = if body.iter().all(u8::is_ascii_whitespace) {
+        InstallBody::default()
+    } else {
+        serde_json::from_slice(&body)?
+    };
+    let st = s.clone();
+    let out = blocking(move || {
+        let _w = st.write_lock();
+        live::install(&store, b.host.as_deref())
+    })
+    .await?;
+    s.invalidate(&ch);
+    Ok(Json(out))
+}
+
+async fn live_uninstall(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let st = s.clone();
+    let out = blocking(move || {
+        let _w = st.write_lock();
+        live::uninstall(&store)
+    })
+    .await?;
+    s.invalidate(&ch);
+    Ok(Json(json!({ "removed": out })))
+}
+
+fn mod_json(m: &conflicts::Mod) -> Value {
+    json!({ "label": m.label, "dir": m.dir, "assets": conflicts::count(m) })
+}
+
+/// Mods in `<workspace>/<chapter>/mods/` (each a UTMT project folder).
+async fn list_mods(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    blocking(move || {
+        Ok(Json(json!({
+            "folder": store.root.join("mods"),
+            "mods": conflicts::mods_folder(&store).iter().map(mod_json).collect::<Vec<_>>(),
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ConflictBody {
+    /// More mod folders (UTMT projects) to check.
+    #[serde(default)]
+    paths: Vec<PathBuf>,
+    /// Check this chapter's own mod too (default true).
+    own: Option<bool>,
+}
+
+async fn check_conflicts(State(s): St, Path(ch): Path<String>, body: Bytes) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let b: ConflictBody = if body.iter().all(u8::is_ascii_whitespace) {
+        ConflictBody {
+            paths: Vec::new(),
+            own: None,
+        }
+    } else {
+        serde_json::from_slice(&body)?
+    };
+    blocking(move || {
+        let mut mods = Vec::new();
+        if b.own.unwrap_or(true) && store.mod_dir().join("project.json").is_file() {
+            mods.push(conflicts::Mod {
+                label: "this mod".into(),
+                dir: store.mod_dir(),
+            });
+        }
+        mods.extend(conflicts::mods_folder(&store));
+        for p in b.paths {
+            conflicts::check_mod_dir(&p)?;
+            let label = p.file_name().and_then(|n| n.to_str()).unwrap_or("mod").to_owned();
+            mods.push(conflicts::Mod { label, dir: p });
+        }
+        // Labels must differ to read the result.
+        let mut seen = std::collections::HashMap::<String, usize>::new();
+        for m in &mut mods {
+            let n = seen.entry(m.label.clone()).or_default();
+            *n += 1;
+            if *n > 1 {
+                m.label = format!("{} ({n})", m.label);
+            }
+        }
+        let findings = conflicts::check(&store.base(), &mods);
+        Ok(Json(json!({
+            "mods": mods.iter().map(mod_json).collect::<Vec<_>>(),
+            "findings": findings,
+        })))
+    })
+    .await
 }
 
 #[cfg(test)]

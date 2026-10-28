@@ -4,7 +4,7 @@ A modding tool for Deltarune that runs in a webpage. A local Rust server (`serve
 [UndertaleModTool](https://github.com/UnderminersTeam/UndertaleModTool) CLI to decompile each chapter,
 serves every asset to the webpage (`web/`), stores edits, and builds a patched `data.win`.
 
-Status: step 1 (backend), step 2 (editors), and step 3 (room preview, bullet patterns, battle box) are done. Build and one-click test launch come next.
+Status: step 1 (backend), step 2 (editors), step 3 (room preview, bullet patterns, battle box), and the game state tools (flags, save files, hot reload, mod conflicts) are done. Build and one-click test launch come later.
 
 ## Download and run (no other downloads)
 
@@ -92,6 +92,24 @@ Known limits:
 - Translations in `lang/*.json` are read-only here (they are not in `data.win`). Step 4 (deploy) copies changed language files.
 - The enemy and cutscene views read decompiled GML. Values that the decompiler writes as numbers (for example an object index) show as numbers.
 
+## Game state and live tools
+
+| Tool | What you can do |
+|---|---|
+| Flags and variables | Every `global.<name>` and `global.<name>[i]` in the chapter code (Deltarune keeps story state in `global.flag[n]` and `global.plot`), with read and write counts and the numbers that the code sets or compares. Click a row: each read and write, with a link to the code line and what it does (`= 1`, `>= 30`). Notes per flag (kept in `workspace/<chapter>/flag-notes.json`). With hot reload: read the flag values of the running game, set a value in the game. |
+| Save files | Edit `filech<chapter>_<slot>` in the save folder line by line. Each line shows the variable that the game writes there: the server reads the order from the chapter's own save script (`scr_saveprocess`: `file_text_write_*` calls, `for`/`repeat`/`while` loops). Story point: plot (with the plot values found in the code), room, set flag N. Save as preset, load a preset or backup into a slot. Every write makes a backup first (`workspace/saves/`, 20 per file). "Send changes to game" sends changed flags and globals to the running game. |
+| Hot reload | Install a small persistent object `obj_dre_live` in the mod (one line in a host code entry, default `obj_time` Step, makes it). After one build, the running game reads `dre_live/cmd.txt` in the save folder 3 times per second. From the page: go to a room, restart the room, set a flag, set a global, set a variable on all instances of an object, replace a sprite with its saved frames, read all flags. The game writes `dre_live/ack.txt` (room, plot) once per second; the page shows "game connected". |
+| Mod conflicts | Compares two or more mods (UTMT project folders: this chapter's `mod/`, folders in `workspace/<chapter>/mods/`, and paths you give) with the original. Code: line diff; changes on different lines can go together ("different parts"), on the same or next lines they conflict. Other assets: by top-level field and by side file (sprite frames, sounds). |
+
+Save folder: set it in Setup, or the server finds it: `%LOCALAPPDATA%\DELTARUNE` (Windows), the Proton prefix `steamapps/compatdata/1671210/.../AppData/Local/DELTARUNE` (Linux), `~/Library/Application Support/com.tobyfox.deltarune` (macOS).
+
+Known limits of the game state tools:
+- Hot reload changes data only. GameMaker has no way to load new code while the game runs, so changes to code, objects, rooms (layout, instances, creation code), dialogue text, sounds, and shaders need a build and a game restart.
+- A hot reloaded sprite is replaced with `sprite_replace` from a PNG strip. The game forgets it at restart; build to keep it. This was tested with the GML compiler (end-to-end test), not yet in the real game.
+- Hot reload values are numbers or plain text, not GML expressions. Commands that the game did not acknowledge go again with the next batch, so a command can run twice.
+- Save labels come from the save script without running it. Conditions in the script (`if`) and loops whose bounds are not numbers are marked with a warning, and the page says when the line counts do not match. The room line holds what the game writes there (for example a room id), not a room name.
+- The flag browser finds `global.<name>` text in decompiled GML. Access through other names (`variable_global_get`, `with (global)`) is not found.
+
 ## How data flows
 
 1. **Extract** (`POST /api/chapters/{ch}/extract`) runs `UndertaleModCli load <data.win> -s export_all.csx`.
@@ -112,7 +130,7 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | Method | Path | Result |
 |---|---|---|
 | GET | `/api/health` | version |
-| GET/PUT | `/api/settings` | `{game_dir, utmt_cli}`. `utmt_cli` must be outside the workspace |
+| GET/PUT | `/api/settings` | `{game_dir, utmt_cli, save_dir}`. `utmt_cli` must be outside the workspace. GET also gives `save_dir_found` (the folder in use) |
 | GET | `/api/asset-types` | the 12 editable types: slug, `$type`, own-directory flag |
 | GET | `/api/chapters` | chapters found in `game_dir`: `launcher`, `chapter1`, ... with `extracted` and `meta` |
 | POST | `/api/chapters/{ch}/extract` | `202 {job}` |
@@ -140,6 +158,21 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | GET/PUT/DELETE | `/api/chapters/{ch}/patterns/{name}` | one pattern (JSON, missing fields get defaults). Kept in `workspace/{ch}/patterns/`, not in the mod. `DELETE ...?uninstall=true` also removes the installed wave object and its code from `mod/` |
 | POST | `/api/chapters/{ch}/patterns/{name}/gml` | body: a pattern, or empty for the saved one. `{object, create:{code, source}, step:{code, source}}` |
 | POST | `/api/chapters/{ch}/patterns/{name}/install` | saves the body (if any), writes the wave object and its two code entries into `mod/` |
+| GET | `/api/chapters/{ch}/flags?q=&name=&offset=&limit=` | global variables: `{total, items:[{name, index, reads, writes, values}]}`. `index` is the index text or `null` |
+| GET | `/api/chapters/{ch}/flags/refs?name=&index=` | each read and write: `[{code, line, name, index, write, detail}]`. No `index`: the plain variable |
+| GET/PUT | `/api/chapters/{ch}/flag-notes` | `{"flag[12]": "note", ...}` |
+| GET | `/api/chapters/{ch}/save-layout` | `{code, fields:[{line, label, kind}], warnings}` from the save script |
+| GET | `/api/saves` | `{dir, files:[{name, chapter, slot, size, modified}], copies:[...]}` (`409` when no save folder) |
+| GET/PUT | `/api/saves/{file}` | `{lines, eol}` / body `{lines}`: writes the file (line ending kept), returns `{backup}`. Only `filech<N>_<slot>` names |
+| POST | `/api/saves/{file}/copy`, `/api/saves/{file}/load` | body `{name}`: save the file as a preset / put a preset or backup into the slot (with a backup) |
+| DELETE | `/api/save-copies/{name}` | delete a preset or backup |
+| GET/POST/DELETE | `/api/chapters/{ch}/live` | hot reload object: status `{installed, host, default_hosts}` / install, body `{host?}` / remove from `mod/` |
+| GET | `/api/live` | `{dir, connected, ack:{seq, room, plot, done, game, age_ms}, seq, pending}` |
+| POST | `/api/live/commands` | body `{commands:[{op, args}]}`. Ops: `flag n v`, `flagstr n text`, `global name v`, `globalstr name text`, `goto room`, `restart`, `var object variable v`, `dumpflags` |
+| POST | `/api/live/sprite/{name}?frames=&xo=&yo=` | body: PNG strip. Writes it to `dre_live/` and sends `sprite_replace` |
+| GET | `/api/live/flags` | `{values, age_ms}` from the last `dumpflags` |
+| GET | `/api/chapters/{ch}/mods` | mods in `workspace/{ch}/mods/` |
+| POST | `/api/chapters/{ch}/conflicts` | body `{paths?, own?}`: `{mods, findings:[{type, name, mods, kind, details}]}`. `kind`: `conflict`, `merge`, `same` |
 
 Asset types (`{type}`): `rooms`, `objects`, `code`, `scripts`, `sprites`, `backgrounds`, `sounds`, `fonts`, `shaders`,
 `paths`, `sequences`, `animcurves`. The `data` JSON is the UTMT project format, so every field that UTMT can import can be changed.
@@ -158,7 +191,7 @@ Code reads (`GET .../assets/code/{name}`) also return `rev`.
 ```sh
 cd server
 cargo test                                         # unit tests
-DRE_TEST_UTMT=/path/to/UndertaleModCli cargo test  # plus the end-to-end test: extract, edit, install a pattern, build, verify
+DRE_TEST_UTMT=/path/to/UndertaleModCli cargo test  # plus the end-to-end test: extract, edit, install a pattern and the hot reload object, build, verify
 cd .. && node --test web/tests/*.test.mjs          # battle simulator and room preview rules
 ```
 

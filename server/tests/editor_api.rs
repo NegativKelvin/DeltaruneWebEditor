@@ -53,6 +53,7 @@ fn setup() -> (tempfile::TempDir, axum::Router) {
         Settings {
             game_dir: Some(game),
             utmt_cli: None,
+            save_dir: None,
         },
     );
     (tmp, dre_server::api::router(state))
@@ -235,4 +236,125 @@ async fn bad_put_changes_nothing() {
     let (_, obj) = call(&app, "GET", uri, None).await;
     assert_eq!(obj["modified"], false);
     assert_eq!(obj["data"]["Visible"], false);
+}
+
+#[tokio::test]
+async fn flags_saves_live_conflicts() {
+    let (t, app) = setup();
+    let ch = "/api/chapters/chapter1";
+    // Flag browser: the cutscene code reads and writes flags.
+    let src = "if (global.flag[7] == 0)\n    global.flag[7] = 1;\nglobal.plot = 40;\n";
+    call(
+        &app,
+        "PUT",
+        &format!("{ch}/assets/code/gml_Object_obj_cs_Step_0"),
+        Some(json!({ "source": src })),
+    )
+    .await;
+    let (_, f) = call(&app, "GET", &format!("{ch}/flags?name=flag"), None).await;
+    assert_eq!(
+        f["items"][0],
+        json!({"name": "flag", "index": "7", "reads": 1, "writes": 1, "values": ["0", "1"]})
+    );
+    let (_, r) = call(&app, "GET", &format!("{ch}/flags/refs?name=plot"), None).await;
+    assert_eq!(r[0]["detail"], "= 40");
+    assert_eq!(r[0]["write"], true);
+    let (_, n) = call(
+        &app,
+        "PUT",
+        &format!("{ch}/flag-notes"),
+        Some(json!({ "flag[7]": "door open", "x": " " })),
+    )
+    .await;
+    assert_eq!(n, json!({ "flag[7]": "door open" }));
+
+    // Save layout from the save script, save file edit with backup.
+    let save_src = "file_text_write_string(f, global.truename);\nfile_text_writeln(f);\nfor (i = 0; i < 2; i++)\n{\n    file_text_write_real(f, global.flag[i]);\n    file_text_writeln(f);\n}\n";
+    call(
+        &app,
+        "PUT",
+        &format!("{ch}/assets/code/gml_GlobalScript_scr_saveprocess"),
+        Some(json!({ "source": save_src })),
+    )
+    .await;
+    let (_, l) = call(&app, "GET", &format!("{ch}/save-layout"), None).await;
+    assert_eq!(l["fields"][2]["label"], "global.flag[1]", "{l}");
+    let (st, _) = call(&app, "GET", "/api/saves", None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let save = t.path().join("save");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("filech1_0"), "Kris\r\n0\r\n0\r\n").unwrap();
+    let (st, _) = call(&app, "PUT", "/api/settings", Some(json!({ "save_dir": save }))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, list) = call(&app, "GET", "/api/saves", None).await;
+    assert_eq!(list["files"][0]["chapter"], 1);
+    let (_, s) = call(&app, "GET", "/api/saves/filech1_0", None).await;
+    assert_eq!(s["lines"], json!(["Kris", "0", "0"]));
+    let (st, b) = call(&app, "PUT", "/api/saves/filech1_0", Some(json!({ "lines": ["Kris", "1", "0"] }))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(b["backup"].as_str().unwrap().starts_with("backup-filech1_0-"));
+    assert_eq!(std::fs::read_to_string(save.join("filech1_0")).unwrap(), "Kris\r\n1\r\n0\r\n");
+    let (st, _) = call(&app, "GET", "/api/saves/settings.json", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    call(&app, "POST", "/api/saves/filech1_0/copy", Some(json!({ "name": "plot40" }))).await;
+    let (st, _) = call(&app, "POST", "/api/saves/filech1_2/load", Some(json!({ "name": "plot40" }))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(save.join("filech1_2").is_file());
+
+    // Hot reload: install, commands, status.
+    std::fs::write(
+        t.path().join("ws/chapter1/base/code/gml_Object_obj_time_Step_0.gml"),
+        "global.time += 1;\n",
+    )
+    .unwrap();
+    let (st, i) = call(&app, "POST", &format!("{ch}/live"), None).await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    let (_, s) = call(&app, "GET", &format!("{ch}/live"), None).await;
+    assert_eq!(s["installed"], true);
+    let cmds = json!({ "commands": [{ "op": "flag", "args": ["7", "1"] }, { "op": "goto", "args": ["room_town"] }] });
+    let (st, _) = call(&app, "POST", "/api/live/commands", Some(cmds)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        std::fs::read_to_string(save.join("dre_live/cmd.txt"))
+            .unwrap()
+            .contains("goto\nroom_town\n")
+    );
+    let (_, s) = call(&app, "GET", "/api/live", None).await;
+    assert_eq!((s["connected"].clone(), s["pending"].clone()), (json!(false), json!(2)));
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/api/live/commands",
+        Some(json!({ "commands": [{ "op": "flag", "args": ["7", "x"] }] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, u) = call(&app, "DELETE", &format!("{ch}/live"), None).await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+
+    // Conflicts: this mod and a mod in mods/ change the same line of the save script.
+    let other = t.path().join("ws/chapter1/mods/other");
+    std::fs::create_dir_all(other.join("code")).unwrap();
+    std::fs::write(other.join("project.json"), "{}").unwrap();
+    std::fs::write(
+        other.join("code/gml_GlobalScript_scr_saveprocess.gml"),
+        save_src.replace("i < 2", "i < 3"),
+    )
+    .unwrap();
+    let (_, m) = call(&app, "GET", &format!("{ch}/mods"), None).await;
+    assert_eq!(m["mods"][0]["label"], "other");
+    let (st, c) = call(&app, "POST", &format!("{ch}/conflicts"), None).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let f = c["findings"].as_array().unwrap();
+    assert_eq!(f.len(), 1, "{c}");
+    assert_eq!(f[0]["name"], "gml_GlobalScript_scr_saveprocess");
+    assert_eq!(f[0]["kind"], "conflict");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("{ch}/conflicts"),
+        Some(json!({ "paths": [t.path().join("game")] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }
