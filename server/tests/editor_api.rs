@@ -53,6 +53,7 @@ fn setup() -> (tempfile::TempDir, axum::Router) {
         Settings {
             game_dir: Some(game),
             utmt_cli: None,
+            ..Default::default()
         },
     );
     (tmp, dre_server::api::router(state))
@@ -235,4 +236,67 @@ async fn bad_put_changes_nothing() {
     let (_, obj) = call(&app, "GET", uri, None).await;
     assert_eq!(obj["modified"], false);
     assert_eq!(obj["data"]["Visible"], false);
+}
+
+#[tokio::test]
+async fn export_lang_and_version_check() {
+    let (tmp, app) = setup();
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/api/chapters/chapter1/assets/objects/obj_cs",
+        Some(json!({ "data": { "Sprite": "spr_a", "Visible": true } })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, vc) = call(&app, "GET", "/api/chapters/chapter1/version-check", None).await;
+    assert_eq!(vc["items"], json!([{ "type": "objects", "name": "obj_cs", "status": "same" }]));
+
+    let (st, l) = call(
+        &app,
+        "PUT",
+        "/api/chapters/chapter1/lang/lang_ja.json",
+        Some(json!({ "k_1": "* やあ。/%" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let (_, li) = call(&app, "GET", "/api/chapters/chapter1/lang", None).await;
+    assert_eq!(li["changed"], json!({ "lang_ja.json": 1 }));
+    let (st, _) = call(&app, "PUT", "/api/chapters/chapter1/lang/x.txt", Some(json!({ "a": "b" }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, ex) = call(&app, "POST", "/api/export", Some(json!({ "id": "t", "name": "Test" }))).await;
+    assert_eq!(st, StatusCode::OK, "{ex}");
+    assert_eq!(ex["manifest"]["chapters"]["chapter1"]["lang"], json!(["lang_ja.json"]));
+    let (_, list) = call(&app, "GET", "/api/exports", None).await;
+    assert_eq!(list[0]["file"], "t.dremod");
+    let (st, _) = call(&app, "GET", "/api/exports/..%2Fsettings.json", None).await;
+    assert_ne!(st, StatusCode::OK);
+    let (st, _) = call(&app, "POST", "/api/export", Some(json!({ "id": "t", "chapters": ["chapter2"] }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // Game update: the base object changes after the edit.
+    std::fs::write(
+        tmp.path().join("ws/chapter1/base/objects/obj_cs.json"),
+        r#"{"$type":"GameObject","Sprite":"spr_b"}"#,
+    )
+    .unwrap();
+    let (_, vc) = call(&app, "GET", "/api/chapters/chapter1/version-check", None).await;
+    assert_eq!(vc["items"][0]["status"], "changed");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/api/chapters/chapter1/version-check/accept",
+        Some(json!({ "type": "objects", "name": "obj_cs" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, vc) = call(&app, "GET", "/api/chapters/chapter1/version-check", None).await;
+    assert_eq!(vc["items"][0]["status"], "same");
+
+    let (st, status) = call(&app, "GET", "/api/loader", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(status["chapters"][0]["state"], "original");
+    let (st, _) = call(&app, "PUT", "/api/loader/mods", Some(json!([{ "id": "nope", "enabled": true }]))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }

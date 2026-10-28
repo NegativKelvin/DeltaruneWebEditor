@@ -107,11 +107,23 @@ impl Utmt {
             return Err("export finished, but output is missing".into());
         }
 
+        // Keep the base version of each change before the new export replaces it (version check).
+        let st = store.clone();
+        tokio::task::spawn_blocking(move || crate::versions::record_missing(&st))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         for (tmp, dst) in [(base_tmp, store.base()), (generic_tmp, store.generic())] {
             replace_dir(&tmp, &dst).await.map_err(io)?;
         }
         let meta = std::fs::metadata(&chapter.data_file).map_err(io)?;
+        let data_file = chapter.data_file.clone();
+        let sha = tokio::task::spawn_blocking(move || crate::hash::file_sha256(&data_file))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(io)?;
         let info = serde_json::json!({
+            "data_file_sha256": sha,
             "data_file": chapter.data_file,
             "data_file_size": meta.len(),
             "data_file_modified": meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()),
@@ -131,21 +143,28 @@ impl Utmt {
         tokio::fs::create_dir_all(&out_dir).await.map_err(|e| e.to_string())?;
         let out = out_dir.join(chapter.data_file.file_name().unwrap());
         let project = store.mod_dir().join("project.json");
+        self.build_project(jobs, job, &store.root, &project, &chapter.data_file, &out)
+            .await?;
+        jobs.log(job, format!("build: wrote {}", out.display()));
+        Ok(out)
+    }
+
+    /// `project build <project> -s <source> -d <out>`.
+    pub async fn build_project(&self, jobs: &Jobs, job: u64, cwd: &Path, project: &Path, source: &Path, out: &Path) -> Result<(), String> {
         let args = [
             std::ffi::OsStr::new("project"),
             "build".as_ref(),
             project.as_os_str(),
             "-s".as_ref(),
-            chapter.data_file.as_os_str(),
+            source.as_os_str(),
             "-d".as_ref(),
             out.as_os_str(),
         ];
-        self.run(jobs, job, &store.root, &args, &[]).await?;
+        self.run(jobs, job, cwd, &args, &[]).await?;
         if !out.is_file() {
             return Err("build finished, but output is missing".into());
         }
-        jobs.log(job, format!("build: wrote {}", out.display()));
-        Ok(out)
+        Ok(())
     }
 }
 
