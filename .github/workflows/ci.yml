@@ -27,6 +27,8 @@ jobs:
         if: steps.utmt-cache.outputs.cache-hit != 'true'
         working-directory: .
         run: scripts/build-utmt.sh linux-x64 "$RUNNER_TEMP/utmt"
+      - name: Install xdelta3 (interop test of .xdelta patches)
+        run: sudo apt-get update && sudo apt-get install -y xdelta3
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

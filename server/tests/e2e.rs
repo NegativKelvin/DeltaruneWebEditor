@@ -225,4 +225,47 @@ async fn extract_edit_build_roundtrip() {
     assert_eq!(st, StatusCode::OK, "{r:#}");
     assert_eq!(std::fs::read(ch1.join("data.win")).unwrap(), original);
     assert!(std::fs::read_to_string(ch1.join("lang/lang_ja.json")).unwrap().contains("ねえ"));
+
+    // xdelta: export a patch of the built chapter, install it like a player, apply it.
+    let (st, x) = call(&app, "POST", "/api/chapters/chapter1/export-xdelta", Some(json!({ "id": "e2e" }))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{x:#}");
+    let job = wait_job(&app, x["job"].as_u64().unwrap()).await;
+    assert_eq!(job["status"], "succeeded", "{job:#}");
+    let patch_path = tmp.path().join("ws/exports/e2e-chapter1.xdelta");
+    let built = std::fs::read(tmp.path().join("ws/chapter1/build/data.win")).unwrap();
+    if std::process::Command::new("xdelta3").arg("-V").output().is_ok() {
+        let out = tmp.path().join("xdelta3-out.win");
+        let st = std::process::Command::new("xdelta3")
+            .args(["-d", "-f", "-s"])
+            .arg(ch1.join("data.win"))
+            .arg(&patch_path)
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert_eq!(std::fs::read(&out).unwrap(), built, "xdelta3 output");
+    }
+    let (st, m) = call_raw(
+        &app,
+        "/api/loader/mods?name=e2e-chapter1.xdelta",
+        std::fs::read(&patch_path).unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m:#}");
+    assert_eq!(m["chapters"]["chapter1"]["xdelta"], "patch.xdelta");
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/api/loader/mods",
+        Some(json!([{ "id": "e2e_mod", "enabled": false }, { "id": "e2e-chapter1", "enabled": true }])),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, j) = call(&app, "POST", "/api/loader/apply", None).await;
+    let job = wait_job(&app, j["job"].as_u64().unwrap()).await;
+    assert_eq!(job["status"], "succeeded", "{job:#}");
+    assert_eq!(std::fs::read(ch1.join("data.win")).unwrap(), built);
+    let (st, _) = call(&app, "POST", "/api/loader/restore", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(std::fs::read(ch1.join("data.win")).unwrap(), original);
 }

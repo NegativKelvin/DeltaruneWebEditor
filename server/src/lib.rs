@@ -17,3 +17,4 @@ pub mod patterns;
 pub mod store;
 pub mod utmt;
 pub mod versions;
+pub mod xdelta;

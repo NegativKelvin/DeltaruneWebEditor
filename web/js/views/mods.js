@@ -1,6 +1,6 @@
 // Mod loader: install .dremod packages, load order, apply to the game, version check, game and save backups.
 import { api } from '../api.js';
-import { h, attempt, confirmDialog, modal, toast, add, clear, pickFiles } from '../ui.js';
+import { h, attempt, confirmDialog, modal, toast, add, clear, pickFiles, promptDialog } from '../ui.js';
 import { followJob } from './jobs.js';
 
 const enc = encodeURIComponent;
@@ -38,7 +38,7 @@ export async function render(main) {
   add(page,
     h('h2', null, 'Mods and backups'),
     h('p', { class: 'dim' },
-      'Install .dremod packages, then Apply. Apply backs up the original game files and the save folder first. ',
+      'Install .dremod packages or .xdelta patches, then Apply. Apply backs up the original game files and the save folder first. ',
       'The original data files stay in workspace/loader/backup. A package has only the changes, never data.win.'),
     top, jobs,
     h('h2', null, 'Game'), chaptersBox,
@@ -63,7 +63,7 @@ export async function render(main) {
   function renderTop() {
     const pending = status.chapters.some((c) => c.pending);
     fill(top, h('div', { class: 'row' },
-      h('button', { class: 'primary', onclick: installAndApply }, 'Install .dremod and apply'),
+      h('button', { class: 'primary', onclick: installAndApply }, 'Install mod and apply'),
       h('button', { onclick: install }, 'Install only'),
       h('button', { class: pending ? 'primary' : '', onclick: apply }, pending ? 'Apply changes to game' : 'Apply again'),
       h('div', { class: 'spacer grow' }),
@@ -103,7 +103,7 @@ export async function render(main) {
         h('tr', null, h('th', null, 'On'), h('th', null, 'Mod'), h('th', null, 'Version'), h('th', null, 'Chapters'), h('th', null, ''), h('th', null, '')),
         mods.map((m, i) => {
           const man = m.manifest || {};
-          const chapters = Object.entries(man.chapters || {}).map(([id, c]) => `${id} (${c.assets.length} assets${c.lang.length ? `, ${c.lang.length} lang` : ''})`);
+          const chapters = Object.entries(man.chapters || {}).map(([id, c]) => `${id} (${c.xdelta ? 'xdelta' : `${c.assets.length} assets`}${c.lang.length ? `, ${c.lang.length} lang` : ''})`);
           return h('tr', null,
             h('td', null, h('input', { type: 'checkbox', checked: m.enabled, onchange: (e) => save(mods.map((x) => (x.id === m.id ? { ...x, enabled: e.target.checked } : x))) })),
             h('td', null, h('b', null, man.name || m.id), man.author ? h('span', { class: 'dim' }, ` by ${man.author}`) : null,
@@ -144,9 +144,17 @@ export async function render(main) {
   }
 
   async function install() {
-    const [file] = await pickFiles('.dremod,.zip');
+    const [file] = await pickFiles('.dremod,.xdelta,.vcdiff,.zip');
     if (!file) return null;
-    const m = await attempt(() => api.postRaw('/api/loader/mods', file), `Installed ${file.name}`);
+    let q = `?name=${enc(file.name)}`;
+    const head = new Uint8Array(await file.slice(0, 3).arrayBuffer());
+    if (head[0] === 0xd6 && head[1] === 0xc3 && head[2] === 0xc4) {
+      const chapters = status.chapters.map((c) => c.id);
+      const ch = await promptDialog(`Chapter for ${file.name} (empty: find it; ${chapters.join(', ')})`, '', 'chapter1');
+      if (ch === null) return null;
+      if (ch.trim()) q += `&chapter=${enc(ch.trim())}`;
+    }
+    const m = await attempt(() => api.postRaw(`/api/loader/mods${q}`, file), `Installed ${file.name}`);
     await load();
     return m;
   }
@@ -184,7 +192,10 @@ export async function render(main) {
       const bad = c.assets.filter((a) => !['same', 'new'].includes(a.status));
       return h('div', { class: 'card' },
         h('h3', null, c.chapter, ' ', c.same_version ? badge(['new', 'same game version']) : badge(['mod', 'other game version'])),
-        !c.checked ? h('p', { class: 'dim' }, 'The mod was made on another game version. Extract this chapter (Setup) to check each asset.') : null,
+        c.xdelta ? h('p', { class: c.same_version ? 'dim' : 'error-box' }, c.same_version
+          ? 'xdelta patch: it fits this game version.'
+          : 'xdelta patch for another game version: it does not apply. Get the patch for this version.') : null,
+        !c.checked && !c.xdelta ? h('p', { class: 'dim' }, 'The mod was made on another game version. Extract this chapter (Setup) to check each asset.') : null,
         c.checked && !bad.length && c.assets.length ? h('p', null, `All ${c.assets.length} changed assets match this game version.`) : null,
         bad.length ? h('table', null, h('tr', null, h('th', null, 'Asset'), h('th', null, 'State')),
           bad.map((a) => h('tr', null, h('td', { class: 'mono small' }, `${a.type}/${a.name}`), h('td', null, badge(CHECK[a.status] || ['', a.status]))))) : null,

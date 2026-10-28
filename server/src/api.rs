@@ -257,6 +257,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chapters/{ch}/lang", get(lang_index))
         .route("/api/chapters/{ch}/lang/{file}", get(get_lang).put(put_lang).delete(delete_lang))
         .route("/api/export", post(export_mod))
+        .route("/api/chapters/{ch}/export-xdelta", post(export_xdelta))
         .route("/api/exports", get(list_exports))
         .route("/api/exports/{file}", get(get_export))
         .route("/api/loader", get(loader_status))
@@ -861,7 +862,11 @@ async fn list_exports(State(s): St) -> Json<Value> {
         .flatten()
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            let file = e.file_name().into_string().ok().filter(|f| f.ends_with(".dremod"))?;
+            let file = e
+                .file_name()
+                .into_string()
+                .ok()
+                .filter(|f| f.ends_with(".dremod") || f.ends_with(".xdelta"))?;
             let m = e.metadata().ok()?;
             let modified = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
             Some(json!({ "file": file, "size": m.len(), "modified": modified }))
@@ -873,17 +878,68 @@ async fn list_exports(State(s): St) -> Json<Value> {
 
 async fn get_export(State(s): St, Path(file): Path<String>) -> Result<impl IntoResponse> {
     store::validate_name(&file)?;
-    if !file.ends_with(".dremod") {
+    let ct = if file.ends_with(".dremod") {
+        "application/zip"
+    } else if file.ends_with(".xdelta") {
+        "application/octet-stream"
+    } else {
         return Err(Error::NotFound(file));
-    }
+    };
     let bytes = tokio::fs::read(exports_dir(&s).join(&file)).await?;
     Ok((
         [
-            (header::CONTENT_TYPE, "application/zip".to_owned()),
+            (header::CONTENT_TYPE, ct.to_owned()),
             (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\"")),
         ],
         bytes,
     ))
+}
+
+#[derive(Deserialize)]
+struct XdeltaExport {
+    id: Option<String>,
+}
+
+/// Builds the chapter, then writes `exports/<id>-<chapter>.xdelta`: the patch from the original data file.
+async fn export_xdelta(State(s): St, Path(ch): Path<String>, body: Bytes) -> Result<impl IntoResponse> {
+    let req: XdeltaExport = if body.iter().all(u8::is_ascii_whitespace) {
+        XdeltaExport { id: None }
+    } else {
+        serde_json::from_slice(&body)?
+    };
+    let id = req.id.filter(|i| !i.is_empty()).unwrap_or_else(|| "mod".into());
+    store::validate_name(&id)?;
+    let store = s.extracted(&ch)?;
+    let (chapter, _) = s.source_chapter(&ch)?;
+    let utmt = s.utmt()?;
+    let file = format!("{id}-{ch}.xdelta");
+    let job = s
+        .jobs
+        .start("export xdelta", &ch)
+        .ok_or_else(|| Error::Conflict(format!("a job already runs for '{ch}'")))?;
+    let st = s.clone();
+    let f = file.clone();
+    tokio::spawn(async move {
+        let r = async {
+            let built = utmt.build(&st.jobs, job, &chapter, &store).await?;
+            let out = exports_dir(&st).join(&f);
+            let original = chapter.data_file.clone();
+            st.jobs.log(job, format!("xdelta: {} -> {}", original.display(), built.display()));
+            let o = out.clone();
+            blocking(move || {
+                std::fs::create_dir_all(o.parent().unwrap())?;
+                crate::xdelta::encode(&original, &built, &o)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            st.jobs.log(job, format!("xdelta: wrote {} ({size} bytes)", out.display()));
+            Ok::<(), String>(())
+        }
+        .await;
+        st.jobs.finish(job, r);
+    });
+    Ok((StatusCode::ACCEPTED, Json(json!({ "job": job, "file": file }))))
 }
 
 async fn loader_status(State(s): St) -> Result<Json<Value>> {
@@ -898,15 +954,30 @@ async fn loader_status(State(s): St) -> Result<Json<Value>> {
     .await
 }
 
-/// Body: the `.dremod` file.
-async fn install_mod(State(s): St, body: Bytes) -> Result<Json<Value>> {
+#[derive(Deserialize)]
+struct InstallQuery {
+    /// File name (an xdelta patch gets its mod id from it).
+    name: Option<String>,
+    /// Chapter of an xdelta patch. Default: the chapter that the patch fits.
+    chapter: Option<String>,
+}
+
+/// Body: a `.dremod` package or an `.xdelta` patch.
+async fn install_mod(State(s): St, Query(q): Query<InstallQuery>, body: Bytes) -> Result<Json<Value>> {
     s.loader_idle()?;
+    let xdelta = crate::xdelta::is_vcdiff(&body);
+    let chapters = if xdelta { s.chapters()? } else { Vec::new() };
     let st = s.clone();
     blocking(move || {
         std::fs::create_dir_all(&st.loader.root)?;
-        let tmp = st.loader.root.join(format!("upload-{}.dremod", std::process::id()));
+        let tmp = st.loader.root.join(format!("upload-{}.tmp", std::process::id()));
         std::fs::write(&tmp, &body)?;
-        let r = st.loader.install(&tmp);
+        let r = if xdelta {
+            let name = q.name.as_deref().unwrap_or("xdelta_mod");
+            st.loader.install_xdelta(&tmp, name, q.chapter.as_deref(), &chapters)
+        } else {
+            st.loader.install(&tmp)
+        };
         let _ = std::fs::remove_file(&tmp);
         Ok(Json(json!(r?)))
     })

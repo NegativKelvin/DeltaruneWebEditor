@@ -25,6 +25,8 @@ use crate::versions;
 
 pub const FORMAT: u32 = 1;
 pub const MANIFEST: &str = "dremod.json";
+/// File name of an xdelta patch in a chapter dir of a package.
+pub const XDELTA_FILE: &str = "patch.xdelta";
 /// Limits for a package that is installed: total unpacked bytes and file count.
 const MAX_UNPACKED: u64 = 8 << 30;
 const MAX_FILES: usize = 500_000;
@@ -62,6 +64,10 @@ pub struct ChapterManifest {
     /// Lang files with changed keys.
     #[serde(default)]
     pub lang: Vec<String>,
+    /// xdelta patch of the whole data file (`<chapter>/patch.xdelta`). It needs the exact game version
+    /// `game_sha256`. Asset changes of other mods are built on its output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdelta: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +121,7 @@ fn allowed_path(parts: &[&str], m: &Manifest) -> bool {
     }
     match rest {
         ["project.json"] => true,
+        ["patch.xdelta"] => m.chapters[*ch].xdelta.is_some(),
         ["lang", f] => langmod::validate_file(f).is_ok(),
         [ty, _] => ASSET_TYPES.iter().any(|t| t.slug == *ty && !t.individual_dir),
         [ty, _, _] => ASSET_TYPES.iter().any(|t| t.slug == *ty && t.individual_dir),
@@ -194,6 +201,7 @@ pub fn export(out_dir: &Path, req: &ExportRequest, chapters: &[ExportChapter]) -
                 game_size: meta.map(|m| m.len()),
                 assets,
                 lang,
+                xdelta: None,
             },
         );
     }
@@ -247,6 +255,9 @@ fn check_manifest(m: &Manifest) -> Result<()> {
         }
         for f in &c.lang {
             langmod::validate_file(f)?;
+        }
+        if c.xdelta.as_deref().is_some_and(|x| x != XDELTA_FILE) {
+            return Err(Error::BadRequest(format!("xdelta file must be '{XDELTA_FILE}'")));
         }
     }
     Ok(())

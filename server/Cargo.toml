@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+lzma-rs = "0.3"
+oxidelta = { version = "0.1.4", default-features = false, features = ["adler32"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"

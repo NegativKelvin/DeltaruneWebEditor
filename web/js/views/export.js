@@ -1,6 +1,7 @@
 // Export mod: make a .dremod package of the changes. Translation changes (lang files) by key.
 import { api, chapterApi } from '../api.js';
 import { h, attempt, confirmDialog, toast, add, promptDialog } from '../ui.js';
+import { followJob } from './jobs.js';
 
 const enc = encodeURIComponent;
 
@@ -22,6 +23,8 @@ export async function render(main, ctx) {
   const result = h('div');
   const exportsBox = h('div', { class: 'card' });
   const langBox = h('div', { class: 'card' });
+  const xdeltaCh = h('select', null, chapters.map((c) => h('option', { value: c.id }, c.id)));
+  const xdeltaJobs = h('div');
 
   add(page,
     h('h2', null, 'Export mod'),
@@ -39,6 +42,13 @@ export async function render(main, ctx) {
       h('div', null, h('span', { class: 'dim small' }, 'Chapters: '), chapterBox),
       h('div', null, h('button', { class: 'primary', onclick: doExport }, 'Export .dremod'))),
     result,
+    h('h2', null, 'xdelta patch'),
+    h('div', { class: 'card col' },
+      h('p', { class: 'dim' },
+        'An .xdelta patch of one data.win (the usual format of Deltarune mods; xdelta3, Delta Patcher, and this loader apply it). ',
+        'It builds the chapter, then stores only the difference to the original data.win. It works only on the exact game version, and has no lang files.'),
+      h('div', { class: 'row' }, xdeltaCh, h('button', { class: 'primary', onclick: doXdelta }, 'Export .xdelta'))),
+    xdeltaJobs,
     h('h2', null, 'Version check'),
     h('p', { class: 'dim' }, 'Each changed asset keeps the hash of the game version it started from. After a game update, extract the chapter again; the chapter overview then lists changes that the game also changed.'),
     h('h2', null, 'Translation changes (lang files)'),
@@ -62,6 +72,16 @@ export async function render(main, ctx) {
     const parts = Object.entries(r.manifest.chapters).map(([id, c]) => `${id}: ${c.assets.length} assets, ${c.lang.length} lang files`);
     result.replaceChildren(h('div', { class: 'note' },
       h('a', { href: `/api/exports/${enc(r.file)}`, download: r.file }, `Download ${r.file}`), ` (${size(r.size)}). `, parts.join('; ')));
+    loadExports();
+  }
+
+  async function doXdelta() {
+    const ch = xdeltaCh.value;
+    const r = await attempt(() => api.post(`/api/chapters/${enc(ch)}/export-xdelta`, { id: form.id || 'mod' }));
+    if (!r) return;
+    const job = await followJob(xdeltaJobs, r.job, `Export .xdelta ${ch}`);
+    if (job.status !== 'succeeded') { toast('xdelta export failed. See the log.', 'error'); return; }
+    xdeltaJobs.append(h('div', { class: 'note' }, h('a', { href: `/api/exports/${enc(r.file)}`, download: r.file }, `Download ${r.file}`)));
     loadExports();
   }
 

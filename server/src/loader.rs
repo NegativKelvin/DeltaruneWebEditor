@@ -171,6 +171,8 @@ pub fn default_save_dir() -> Option<PathBuf> {
 
 /// Per chapter, what the enabled mods want: mods with assets, and lang file -> mods.
 struct Want {
+    /// Mod with an xdelta patch for the data file (the last one in load order).
+    xdelta: Option<String>,
     asset_mods: Vec<String>,
     lang: BTreeMap<String, Vec<String>>,
     all: Vec<String>,
@@ -221,6 +223,102 @@ impl Loader {
         let p = self.mod_dir(id).join(modpkg::MANIFEST);
         let b = std::fs::read(&p).map_err(|_| Error::NotFound(format!("mod '{id}'")))?;
         Ok(serde_json::from_slice(&b)?)
+    }
+
+    fn has_xdelta(&self, id: &str, chapter: &str) -> bool {
+        self.manifest(id)
+            .is_ok_and(|m| m.chapters.get(chapter).is_some_and(|c| c.xdelta.is_some()))
+    }
+
+    /// Installs an xdelta patch as a mod. `chapter`: the chapter it is for; `None` tries each chapter
+    /// (the patch must have window checksums). The patch must fit the original data file of the chapter.
+    pub fn install_xdelta(&self, patch: &Path, name: &str, chapter: Option<&str>, chapters: &[Chapter]) -> Result<Manifest> {
+        let info = crate::xdelta::info(&std::fs::read(patch)?)?;
+        let id: String = name
+            .trim_end_matches(".xdelta")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim_start_matches('.')
+            .chars()
+            .take(100)
+            .collect();
+        let id = if id.is_empty() { "xdelta_mod".to_owned() } else { id };
+        let candidates: Vec<&Chapter> = match chapter {
+            Some(c) => vec![
+                chapters
+                    .iter()
+                    .find(|x| x.id == c)
+                    .ok_or_else(|| Error::NotFound(format!("chapter '{c}'")))?,
+            ],
+            None if !info.checksums => {
+                return Err(Error::BadRequest(
+                    "this patch has no checksums, so the chapter cannot be found; choose the chapter".into(),
+                ));
+            }
+            None => chapters.iter().collect(),
+        };
+        std::fs::create_dir_all(self.deploy_dir())?;
+        let probe = self.deploy_dir().join(format!("probe-{}", std::process::id()));
+        let mut found = None;
+        let mut last_err = None;
+        for ch in candidates {
+            let original = self.original_data_file(ch);
+            match crate::xdelta::decode(&original, patch, &probe) {
+                Ok(_) => {
+                    found = Some((ch, file_sha256(&original)?, std::fs::metadata(&original)?.len()));
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let _ = std::fs::remove_file(&probe);
+        let Some((ch, sha, size)) = found else {
+            return Err(match (chapter, last_err) {
+                (Some(_), Some(e)) => e,
+                _ => Error::BadRequest("the patch fits no chapter of this game (other game version?)".into()),
+            });
+        };
+        let m = Manifest {
+            format: modpkg::FORMAT,
+            id: id.clone(),
+            name: name.to_owned(),
+            version: String::new(),
+            author: String::new(),
+            description: format!("xdelta patch for {}", ch.id),
+            editor: env!("CARGO_PKG_VERSION").into(),
+            created: now_ms() / 1000,
+            chapters: BTreeMap::from([(
+                ch.id.clone(),
+                modpkg::ChapterManifest {
+                    data_file: ch.data_file.file_name().unwrap().to_string_lossy().into_owned(),
+                    game_sha256: Some(sha),
+                    game_size: Some(size),
+                    assets: Vec::new(),
+                    lang: Vec::new(),
+                    xdelta: Some(modpkg::XDELTA_FILE.into()),
+                },
+            )]),
+        };
+        let dst = self.mod_dir(&id);
+        if dst.exists() {
+            std::fs::remove_dir_all(&dst)?;
+        }
+        std::fs::create_dir_all(dst.join(&ch.id))?;
+        std::fs::copy(patch, dst.join(&ch.id).join(modpkg::XDELTA_FILE))?;
+        std::fs::write(dst.join(modpkg::MANIFEST), serde_json::to_vec_pretty(&m)?)?;
+        let mut s = self.load_state();
+        if !s.mods.iter().any(|e| e.id == id) {
+            s.mods.push(ModEntry { id, enabled: true });
+        }
+        self.save_state(&s)?;
+        Ok(m)
     }
 
     /// Installs (or replaces) a package. A new mod goes last in the load order, enabled.
@@ -293,6 +391,7 @@ impl Loader {
 
     fn want(&self, s: &LoaderState, chapter: &str) -> Result<Want> {
         let mut w = Want {
+            xdelta: None,
             asset_mods: Vec::new(),
             lang: BTreeMap::new(),
             all: Vec::new(),
@@ -302,6 +401,9 @@ impl Loader {
             let Some(c) = m.chapters.get(chapter) else { continue };
             if !c.assets.is_empty() {
                 w.asset_mods.push(e.id.clone());
+            }
+            if c.xdelta.is_some() {
+                w.xdelta = Some(e.id.clone());
             }
             for f in &c.lang {
                 w.lang.entry(f.clone()).or_default().push(e.id.clone());
@@ -379,6 +481,7 @@ impl Loader {
             out.push(json!({
                 "chapter": cid,
                 "in_game": true,
+                "xdelta": cm.xdelta.is_some(),
                 "same_version": same,
                 "checked": checked,
                 "assets": assets,
@@ -555,7 +658,41 @@ impl Loader {
                 mods: want.all.clone(),
                 ..Applied::default()
             };
-            if want.asset_mods.is_empty() {
+            let mut source = original.clone();
+            if let Some(xid) = &want.xdelta {
+                let others: Vec<&String> = want.all.iter().filter(|m| *m != xid && self.has_xdelta(m, &ch.id)).collect();
+                if !others.is_empty() {
+                    log(format!(
+                        "{}: more than one xdelta patch; only '{xid}' (last in load order) is used, not {:?}",
+                        ch.id, others
+                    ));
+                }
+                let patch = self.mod_dir(xid).join(&ch.id).join(modpkg::XDELTA_FILE);
+                let out = self
+                    .deploy_dir()
+                    .join(format!("{}.xdelta", ch.id))
+                    .join(ch.data_file.file_name().unwrap());
+                let (o, d) = (original.clone(), out.clone());
+                blocking(move || {
+                    std::fs::create_dir_all(d.parent().unwrap())?;
+                    crate::xdelta::decode(&o, &patch, &d)
+                })
+                .await
+                .map_err(|e| Error::BadRequest(format!("{}: mod '{xid}': {e}", ch.id)))?;
+                log(format!("{}: xdelta patch of '{xid}' applied", ch.id));
+                source = out;
+            }
+            if want.asset_mods.is_empty() && want.xdelta.is_some() {
+                let (o, g) = (source.clone(), ch.data_file.clone());
+                applied.data = Some(
+                    blocking(move || {
+                        copy_atomic(&o, &g)?;
+                        Ok(FileStamp::of(&g)?)
+                    })
+                    .await?,
+                );
+                log(format!("{}: wrote {}", ch.id, ch.data_file.display()));
+            } else if want.asset_mods.is_empty() {
                 if prev
                     .as_ref()
                     .and_then(|a| a.data.as_ref())
@@ -577,7 +714,7 @@ impl Loader {
                     .join(format!("{}.out", ch.id))
                     .join(ch.data_file.file_name().unwrap());
                 tokio::fs::create_dir_all(out.parent().unwrap()).await?;
-                utmt.build_project(jobs, job, &project_dir, &project_dir.join("project.json"), &original, &out)
+                utmt.build_project(jobs, job, &project_dir, &project_dir.join("project.json"), &source, &out)
                     .await
                     .map_err(Error::Other)?;
                 let g = ch.data_file.clone();
@@ -894,6 +1031,36 @@ mod tests {
         let c = e.loader.check(&e.ws, "one", std::slice::from_ref(&e.ch)).unwrap();
         assert_eq!(c[0]["same_version"], false);
         assert_eq!(c[0]["checked"], false);
+    }
+
+    #[tokio::test]
+    async fn xdelta_mod_install_apply_and_wrong_version() {
+        let e = env();
+        let target = e.ws.join("modded.win");
+        std::fs::write(&target, b"ORIGINAL with an xdelta change").unwrap();
+        let patch = e.ws.join("my mod.xdelta");
+        crate::xdelta::encode(&e.ch.data_file, &target, &patch).unwrap();
+        let chapters = std::slice::from_ref(&e.ch);
+        let m = e.loader.install_xdelta(&patch, "my mod.xdelta", None, chapters).unwrap();
+        assert_eq!(m.id, "my_mod");
+        assert!(m.chapters["chapter1"].xdelta.is_some());
+        let c = e.loader.check(&e.ws, "my_mod", chapters).unwrap();
+        assert_eq!(c[0]["xdelta"], true);
+        assert_eq!(c[0]["same_version"], true);
+
+        let jobs = Jobs::default();
+        let job = jobs.start("apply", "game").unwrap();
+        e.loader.apply(&jobs, job, None, vec![e.ch.clone()], None).await.unwrap();
+        assert_eq!(std::fs::read(&e.ch.data_file).unwrap(), std::fs::read(&target).unwrap());
+        assert_eq!(e.loader.original_data_file(&e.ch), e.loader.backup_data(&e.ch));
+        e.loader.restore(chapters).unwrap();
+        assert_eq!(std::fs::read(&e.ch.data_file).unwrap(), b"ORIGINAL");
+
+        // Another game version: install and apply refuse the patch.
+        std::fs::write(&e.ch.data_file, b"UPDATED GAME FILE, OTHER VERSION").unwrap();
+        assert!(e.loader.install_xdelta(&patch, "x", None, chapters).is_err());
+        assert!(e.loader.apply(&jobs, job, None, vec![e.ch.clone()], None).await.is_err());
+        assert_eq!(std::fs::read(&e.ch.data_file).unwrap(), b"UPDATED GAME FILE, OTHER VERSION");
     }
 
     #[test]
