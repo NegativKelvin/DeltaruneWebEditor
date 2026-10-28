@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use axum::Json;
@@ -40,18 +41,26 @@ pub struct AppState {
     dialogue_cache: Mutex<HashMap<String, Arc<Vec<DialogueLine>>>>,
     cutscene_cache: Mutex<HashMap<String, Arc<CutsceneList>>>,
     enemy_cache: Mutex<HashMap<String, Arc<Vec<enemies::Record>>>>,
+    /// Goes up on each invalidate, so an index that was built from older files is not kept.
+    epoch: AtomicU64,
+    /// Chapter dir -> lang files (read again when a file changes).
+    lang_cache: Mutex<HashMap<PathBuf, (dialogue::LangStamp, Arc<dialogue::Langs>)>>,
 }
 
 /// Code entries with `c_*` steps: (name, step count).
 type CutsceneList = Vec<(String, usize)>;
 
-/// Gets a per-chapter index from a cache, or builds it.
-fn cached<T>(cache: &Mutex<HashMap<String, Arc<T>>>, chapter: &str, build: impl FnOnce() -> T) -> Arc<T> {
+/// Gets a per-chapter index from a cache, or builds it. The index is not kept when files changed during the build.
+fn cached<T>(cache: &Mutex<HashMap<String, Arc<T>>>, epoch: &AtomicU64, chapter: &str, build: impl FnOnce() -> T) -> Arc<T> {
     if let Some(c) = cache.lock().unwrap().get(chapter) {
         return c.clone();
     }
+    let start = epoch.load(Ordering::SeqCst);
     let v = Arc::new(build());
-    cache.lock().unwrap().insert(chapter.to_owned(), v.clone());
+    let mut c = cache.lock().unwrap();
+    if epoch.load(Ordering::SeqCst) == start {
+        c.insert(chapter.to_owned(), v.clone());
+    }
     v
 }
 
@@ -66,6 +75,8 @@ impl AppState {
             dialogue_cache: Mutex::default(),
             cutscene_cache: Mutex::default(),
             enemy_cache: Mutex::default(),
+            epoch: AtomicU64::new(0),
+            lang_cache: Mutex::default(),
         })
     }
 
@@ -124,13 +135,27 @@ impl AppState {
     }
 
     fn invalidate(&self, chapter: &str) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.dialogue_cache.lock().unwrap().remove(chapter);
         self.cutscene_cache.lock().unwrap().remove(chapter);
         self.enemy_cache.lock().unwrap().remove(chapter);
     }
 
+    /// `lang/*.json` of a chapter dir, from the cache while no file changed.
+    fn langs(&self, dir: &std::path::Path) -> Arc<dialogue::Langs> {
+        let stamp = dialogue::lang_stamp(dir);
+        if let Some((st, l)) = self.lang_cache.lock().unwrap().get(dir)
+            && *st == stamp
+        {
+            return l.clone();
+        }
+        let l = Arc::new(dialogue::load_lang(dir));
+        self.lang_cache.lock().unwrap().insert(dir.to_path_buf(), (stamp, l.clone()));
+        l
+    }
+
     fn dialogue(&self, chapter: &str, store: &ChapterStore) -> Arc<Vec<DialogueLine>> {
-        cached(&self.dialogue_cache, chapter, || {
+        cached(&self.dialogue_cache, &self.epoch, chapter, || {
             store
                 .code_sources()
                 .flat_map(|(name, src)| dialogue::scan_source(&name, &src))
@@ -436,7 +461,7 @@ async fn list_cutscenes(State(s): St, Path(ch): Path<String>, Query(q): Query<Li
     let store = s.extracted(&ch)?;
     let st = s.clone();
     blocking(move || {
-        let all = cached(&st.cutscene_cache, &ch, || {
+        let all = cached(&st.cutscene_cache, &st.epoch, &ch, || {
             let mut v: Vec<(String, usize)> = store
                 .code_sources()
                 .map(|(name, src)| (name, cutscene::count(&src)))
@@ -473,7 +498,7 @@ async fn get_enemies(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>
     let store = s.extracted(&ch)?;
     let st = s.clone();
     blocking(move || {
-        let recs = cached(&st.enemy_cache, &ch, || {
+        let recs = cached(&st.enemy_cache, &st.epoch, &ch, || {
             store
                 .code_sources()
                 .flat_map(|(name, src)| enemies::scan_source(&name, &src))
@@ -499,7 +524,7 @@ async fn get_dialogue(State(s): St, Path(ch): Path<String>, Query(q): Query<List
     let st = s.clone();
     blocking(move || {
         let lines = st.dialogue(&chapter.id, &store);
-        let langs = dialogue::load_lang(&chapter.dir);
+        let langs = st.langs(&chapter.dir);
         let needle = q.q.map(|x| x.to_lowercase());
         let matches = |l: &DialogueLine| {
             q.code.as_ref().is_none_or(|c| &l.code == c)
@@ -598,4 +623,24 @@ async fn install_pattern(State(s): St, Path((ch, name)): Path<(String, String)>,
     let out = blocking(move || patterns::install(&store, &name, &pat)).await?;
     s.invalidate(&ch);
     Ok(Json(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_drops_index_built_during_invalidate() {
+        let cache: Mutex<HashMap<String, Arc<u32>>> = Mutex::default();
+        let epoch = AtomicU64::new(0);
+        // Files change while the index builds: the old index is returned once, not kept.
+        let v = cached(&cache, &epoch, "c", || {
+            epoch.fetch_add(1, Ordering::SeqCst);
+            1
+        });
+        assert_eq!(*v, 1);
+        assert!(cache.lock().unwrap().is_empty());
+        assert_eq!(*cached(&cache, &epoch, "c", || 2), 2);
+        assert_eq!(*cached(&cache, &epoch, "c", || 3), 2);
+    }
 }

@@ -93,10 +93,7 @@ impl Utmt {
         }
 
         for (tmp, dst) in [(base_tmp, store.base()), (generic_tmp, store.generic())] {
-            if dst.exists() {
-                tokio::fs::remove_dir_all(&dst).await.map_err(io)?;
-            }
-            tokio::fs::rename(&tmp, &dst).await.map_err(io)?;
+            replace_dir(&tmp, &dst).await.map_err(io)?;
         }
         let meta = std::fs::metadata(&chapter.data_file).map_err(io)?;
         let info = serde_json::json!({
@@ -137,6 +134,31 @@ impl Utmt {
     }
 }
 
+/// Puts `new` at `dst`. The old `dst` is moved aside first and only removed after the new one is in place,
+/// so a failure keeps the old export.
+async fn replace_dir(new: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut old = dst.as_os_str().to_owned();
+    old.push(".old");
+    let old = PathBuf::from(old);
+    if old.exists() {
+        tokio::fs::remove_dir_all(&old).await?;
+    }
+    let had_old = dst.exists();
+    if had_old {
+        tokio::fs::rename(dst, &old).await?;
+    }
+    if let Err(e) = tokio::fs::rename(new, dst).await {
+        if had_old {
+            let _ = tokio::fs::rename(&old, dst).await;
+        }
+        return Err(e);
+    }
+    if had_old {
+        tokio::fs::remove_dir_all(&old).await?;
+    }
+    Ok(())
+}
+
 /// Folder of the running server executable.
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
@@ -156,4 +178,26 @@ pub fn locate_cli() -> Option<PathBuf> {
         dirs.extend(std::env::split_paths(&path));
     }
     dirs.into_iter().map(|d| d.join(exe)).find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replace_dir_keeps_old_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("base");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("project.json"), "old").unwrap();
+        // The new dir is missing: the rename fails, and the old export stays.
+        assert!(replace_dir(&tmp.path().join("missing"), &dst).await.is_err());
+        assert_eq!(std::fs::read_to_string(dst.join("project.json")).unwrap(), "old");
+        let new = tmp.path().join("base.tmp");
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(new.join("project.json"), "new").unwrap();
+        replace_dir(&new, &dst).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("project.json")).unwrap(), "new");
+        assert!(!tmp.path().join("base.old").exists() && !new.exists());
+    }
 }

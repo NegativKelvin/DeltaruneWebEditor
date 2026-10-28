@@ -96,8 +96,28 @@ pub fn scan_source(code: &str, src: &str) -> Vec<DialogueLine> {
     out
 }
 
+/// Language -> (key -> text).
+pub type Langs = BTreeMap<String, BTreeMap<String, String>>;
+
+/// Name, size, and change time of each file in `lang/`. Equal stamps: the files did not change.
+pub type LangStamp = Vec<(std::ffi::OsString, u64, Option<std::time::SystemTime>)>;
+
+pub fn lang_stamp(chapter_dir: &Path) -> LangStamp {
+    let mut v: LangStamp = std::fs::read_dir(chapter_dir.join("lang"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((e.file_name(), m.len(), m.modified().ok()))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
 /// Loads `lang/*.json` (key -> text) from a chapter dir. Returns language -> table.
-pub fn load_lang(chapter_dir: &Path) -> BTreeMap<String, BTreeMap<String, String>> {
+pub fn load_lang(chapter_dir: &Path) -> Langs {
     let mut langs = BTreeMap::new();
     let Ok(rd) = std::fs::read_dir(chapter_dir.join("lang")) else {
         return langs;
@@ -171,8 +191,12 @@ msgset(0, "* Plain./%");
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("lang")).unwrap();
         std::fs::write(tmp.path().join("lang/lang_ja.json"), r#"{"k":"こんにちは","n":1}"#).unwrap();
+        let stamp = lang_stamp(tmp.path());
+        assert_eq!(stamp, lang_stamp(tmp.path()));
         let langs = load_lang(tmp.path());
         assert_eq!(langs["ja"]["k"], "こんにちは");
         assert!(!langs["ja"].contains_key("n"));
+        std::fs::write(tmp.path().join("lang/lang_en.json"), r#"{"k":"Hi"}"#).unwrap();
+        assert_ne!(stamp, lang_stamp(tmp.path()));
     }
 }

@@ -19,6 +19,8 @@ pub const WAVE_PREFIX: &str = "obj_dre_wave_";
 const MAX_FRAMES: u32 = 30 * 60 * 5;
 const MAX_EMITTERS: usize = 64;
 const MAX_COUNT: u32 = 256;
+/// After `duration`, the wave keeps updating its bullets until none are left, for at most this many steps.
+const CLEANUP_FRAMES: u32 = 30 * 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -390,8 +392,9 @@ pub fn to_gml(name: &str, p: &Pattern) -> Result<WaveGml> {
                 n(l.h)
             );
         }
+        let _ = writeln!(o, "if (dre_t <= {} && instance_exists(obj_growtangle))", p.duration);
         o.push_str(
-            "if (instance_exists(obj_growtangle))\n{\n    with (obj_growtangle)\n    {\n        \
+            "{\n    with (obj_growtangle)\n    {\n        \
              x = dre_cx + dre_kx;\n        y = dre_cy + dre_ky;\n        \
              image_xscale = dre_kw / max(1, sprite_get_width(sprite_index));\n        \
              image_yscale = dre_kh / max(1, sprite_get_height(sprite_index));\n    }\n}\n\
@@ -407,17 +410,25 @@ pub fn to_gml(name: &str, p: &Pattern) -> Result<WaveGml> {
     let _ = write!(
         o,
         "// Bullets of this wave: life, speed change, turn. Far off screen: destroy.\n\
+         var dre_left = 0;\n\
          with ({bo})\n{{\n    if (variable_instance_exists(id, \"dre_wave\") && dre_wave == other.id)\n    {{\n        \
          if (dre_life > 0)\n            dre_life -= 1;\n        \
          if (dre_life == 0 || x < (dre_cx - 320) || x > (dre_cx + 960) || y < (dre_cy - 320) || y > (dre_cy + 800))\n        {{\n            \
          instance_destroy();\n        }}\n        else\n        {{\n            \
          speed += dre_acc;\n            direction += dre_turn;\n            \
-         if (dre_rot)\n                image_angle = direction;\n        }}\n    }}\n}}\n"
+         if (dre_rot)\n                image_angle = direction;\n            \
+         dre_left += 1;\n        }}\n    }}\n}}\n"
     );
     for (i, e) in p.emitters.iter().enumerate().filter(|(_, e)| e.enabled) {
-        emitter_gml(&mut o, i, e, bo);
+        emitter_gml(&mut o, i, e, bo, p.duration);
     }
-    let _ = write!(o, "dre_t += 1;\nif (dre_t > {})\n    instance_destroy();\n", p.duration);
+    // After the wave time, no more shots, but the bullets that are left keep their life, speed change, and turn.
+    let _ = write!(
+        o,
+        "dre_t += 1;\nif (dre_t > {} && (dre_left == 0 || dre_t > {}))\n    instance_destroy();\n",
+        p.duration,
+        p.duration + CLEANUP_FRAMES
+    );
 
     Ok(WaveGml {
         create_code: format!("gml_Object_{object}_Create_0"),
@@ -428,14 +439,14 @@ pub fn to_gml(name: &str, p: &Pattern) -> Result<WaveGml> {
     })
 }
 
-fn emitter_gml(o: &mut String, i: usize, e: &Emitter, bo: &str) {
+fn emitter_gml(o: &mut String, i: usize, e: &Emitter, bo: &str, duration: u32) {
     let ind = "    ";
-    let _ = writeln!(o, "// Emitter {i}: {}", e.name.replace('\n', " "));
+    let _ = writeln!(o, "// Emitter {i}: {}", e.name.replace(['\n', '\r'], " "));
     let _ = writeln!(
         o,
         "if (dre_t >= {s} && dre_t <= {end} && ((dre_t - {s}) mod {iv}) == 0)\n{{",
         s = e.start,
-        end = e.end,
+        end = e.end.min(duration),
         iv = e.interval
     );
     let _ = writeln!(o, "{ind}var dre_n = (dre_t - {}) div {};", e.start, e.interval);
@@ -741,7 +752,8 @@ mod tests {
         assert!(st.contains("dre_b.sprite_index = spr_bullet;"));
         assert!(st.contains("        with (dre_b)\n        {\n            image_blend = c_red;\n        }"));
         assert!(!st.contains("Emitter 1"));
-        assert!(st.ends_with("dre_t += 1;\nif (dre_t > 240)\n    instance_destroy();\n"));
+        assert!(st.ends_with("dre_t += 1;\nif (dre_t > 240 && (dre_left == 0 || dre_t > 1140))\n    instance_destroy();\n"));
+        assert!(st.contains("var dre_left = 0;"));
         assert_eq!(st.matches('{').count(), st.matches('}').count());
         assert!(!st.contains("obj_growtangle)\n    {\n        x ="));
     }
@@ -765,10 +777,33 @@ mod tests {
         assert!(g.step.contains("dre_kh = lerp(150, 75.5, dre_k);"));
         assert!(g.step.contains("if (dre_t >= 60)\n{\n    dre_kx = 320;"));
         assert!(g.step.contains("(360 * dre_i / 8)"));
+        assert!(
+            g.step
+                .contains("if (dre_t <= 240 && instance_exists(obj_growtangle))\n{\n    with (obj_growtangle)")
+        );
         assert_eq!(g.step.matches('{').count(), g.step.matches('}').count());
         assert_eq!(n(0.1 + 0.2), "0.3");
         assert_eq!(n(-3.0), "-3");
         assert_eq!(s("a\"b\\"), "\"a\\\"b\\\\\"");
+    }
+
+    /// After the wave time: no shots, no box moves, the wave stays until its bullets are gone.
+    #[test]
+    fn gml_after_duration() {
+        let mut p = Pattern {
+            duration: 100,
+            ..Pattern::default()
+        };
+        p.emitters[0].end = 500;
+        p.emitters[0].name = "a\r\nb".into();
+        let g = to_gml("w", &p).unwrap();
+        assert!(g.step.contains("dre_t >= 10 && dre_t <= 100 &&"));
+        assert!(g.step.contains("// Emitter 0: a  b\n"));
+        assert!(g.step.contains("            dre_left += 1;\n"));
+        assert!(
+            g.step
+                .ends_with("if (dre_t > 100 && (dre_left == 0 || dre_t > 1000))\n    instance_destroy();\n")
+        );
     }
 
     #[test]

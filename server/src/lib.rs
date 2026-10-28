@@ -7,6 +7,7 @@ pub mod dialogue;
 pub mod enemies;
 pub mod error;
 pub mod gml;
+pub mod guard;
 pub mod jobs;
 pub mod patterns;
 pub mod store;

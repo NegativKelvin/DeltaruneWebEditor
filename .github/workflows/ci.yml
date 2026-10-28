@@ -16,7 +16,15 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+      # The pinned build only changes with the script (tag and commit are in it).
+      - name: Cache UndertaleModCli
+        id: utmt-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/utmt
+          key: utmt-linux-x64-${{ hashFiles('scripts/build-utmt.sh') }}
       - name: Build UndertaleModCli (pinned, same script as the release)
+        if: steps.utmt-cache.outputs.cache-hit != 'true'
         working-directory: .
         run: scripts/build-utmt.sh linux-x64 "$RUNNER_TEMP/utmt"
       - run: cargo fmt --check

@@ -180,9 +180,9 @@ async fn bullet_patterns() {
     // GML of an unsaved body, and of the saved pattern.
     let (st, g) = call(&app, "POST", &format!("{base}/w1/gml"), Some(json!({ "duration": 7 }))).await;
     assert_eq!(st, StatusCode::OK);
-    assert!(g["step"]["source"].as_str().unwrap().contains("if (dre_t > 7)"));
+    assert!(g["step"]["source"].as_str().unwrap().contains("if (dre_t > 7 && "));
     let (_, g) = call(&app, "POST", &format!("{base}/w1/gml"), None).await;
-    assert!(g["step"]["source"].as_str().unwrap().contains("if (dre_t > 50)"));
+    assert!(g["step"]["source"].as_str().unwrap().contains("if (dre_t > 50 && "));
     let (st, r) = call(&app, "POST", &format!("{base}/w1/install"), None).await;
     assert_eq!(st, StatusCode::OK, "{r}");
     let (_, obj) = call(&app, "GET", "/api/chapters/chapter1/assets/objects/obj_dre_wave_w1", None).await;
