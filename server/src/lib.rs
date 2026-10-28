@@ -19,6 +19,8 @@ pub mod modpkg;
 pub mod patterns;
 pub mod saves;
 pub mod store;
+pub mod text;
 pub mod utmt;
 pub mod versions;
+pub mod wizards;
 pub mod xdelta;

@@ -244,6 +244,16 @@ impl ChapterStore {
         Err(Error::NotFound(format!("{}/{name}", ty.slug)))
     }
 
+    /// The asset exists (in mod/ or base/).
+    pub fn has(&self, ty: &AssetType, name: &str) -> bool {
+        self.resolve(ty, name).is_ok()
+    }
+
+    /// The asset has a copy in mod/ (changed or new).
+    pub fn in_mod(&self, ty: &AssetType, name: &str) -> bool {
+        self.resolve(ty, name).is_ok_and(|(_, m)| m)
+    }
+
     /// Side files that belong to an asset (gml source, png frames, shader text, audio, ...).
     fn side_files(json_path: &Path, ty: &AssetType, name: &str) -> Vec<PathBuf> {
         let dir = json_path.parent().unwrap_or(Path::new("."));

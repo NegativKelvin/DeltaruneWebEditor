@@ -31,8 +31,10 @@ use crate::modpkg::{self, ExportChapter, ExportRequest};
 use crate::patterns::{self, Pattern, PatternStore};
 use crate::saves::{self, Saves};
 use crate::store::{self, ASSET_TYPES, ChapterStore};
+use crate::text;
 use crate::utmt::Utmt;
 use crate::versions;
+use crate::wizards;
 
 /// Job "chapter" of the mod loader (one apply at a time).
 const GAME_JOB: &str = "game";
@@ -273,7 +275,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chapters/{ch}/code/{name}/patch", post(patch_code))
         .route("/api/chapters/{ch}/index/{ty}", get(asset_index))
         .route("/api/chapters/{ch}/cutscenes", get(list_cutscenes))
-        .route("/api/chapters/{ch}/cutscenes/{code}", get(get_cutscene))
+        .route("/api/chapters/{ch}/cutscenes/{code}", get(get_cutscene).put(put_cutscene))
+        .route("/api/chapters/{ch}/wizards/{kind}", post(run_wizard))
+        .route("/api/chapters/{ch}/text/check", get(text_check))
+        .route("/api/chapters/{ch}/text/replace", post(text_replace))
         .route("/api/chapters/{ch}/enemies", get(get_enemies))
         .route("/api/chapters/{ch}/generic", get(generic_index))
         .route("/api/chapters/{ch}/generic/{list}", get(generic_list))
@@ -668,7 +673,152 @@ async fn get_cutscene(State(s): St, Path((ch, code)): Path<(String, String)>) ->
         "modified": asset["modified"],
         "source": src,
         "blocks": cutscene::blocks(src),
+        "sections": cutscene::sections(src),
     })))
+}
+
+#[derive(Deserialize)]
+struct PutCutscene {
+    rev: String,
+    #[serde(default)]
+    blocks: Vec<cutscene::BlockEdit>,
+    #[serde(default)]
+    sections: Vec<cutscene::NewSection>,
+}
+
+/// Writes changed blocks and new `con` sections. Every step is checked before the code changes.
+async fn put_cutscene(State(s): St, Path((ch, code)): Path<(String, String)>, Json(body): Json<PutCutscene>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    {
+        let _w = s.write_lock();
+        let cur = store.read(store::asset_type("code")?, &code)?;
+        let src = cur["source"].as_str().unwrap_or_default();
+        if gml::rev(src) != body.rev {
+            return Err(Error::Conflict(format!("code '{code}' changed; reload it and try again")));
+        }
+        let edits = cutscene::edits(src, &body.blocks, &body.sections)?;
+        store.patch_code(&code, &body.rev, &edits)?;
+    }
+    s.invalidate(&ch);
+    get_cutscene(State(s), Path((ch, code))).await
+}
+
+#[derive(Deserialize)]
+struct WizardQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Makes a wizard plan; writes it unless `dry_run`.
+async fn run_wizard(
+    State(s): St,
+    Path((ch, kind)): Path<(String, String)>,
+    Query(q): Query<WizardQuery>,
+    Json(params): Json<Value>,
+) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let st = s.clone();
+    let plan = blocking(move || {
+        let _w = (!q.dry_run).then(|| st.write_lock());
+        let plan = wizards::plan(&store, &kind, params)?;
+        if !q.dry_run {
+            wizards::apply(&store, &plan)?;
+        }
+        Ok(plan)
+    })
+    .await?;
+    if !q.dry_run {
+        s.invalidate(&ch);
+    }
+    Ok(Json(json!({ "applied": !q.dry_run, "writes": plan.writes, "notes": plan.notes })))
+}
+
+#[derive(Deserialize)]
+struct TextCheckQuery {
+    // Not `flatten`: URL query values are text, and flattened numbers do not parse.
+    chars: Option<usize>,
+    face_chars: Option<usize>,
+    lines: Option<usize>,
+    px: Option<f64>,
+    face_px: Option<f64>,
+    /// Font asset: measure in pixels with its glyphs (needs `px`).
+    font: Option<String>,
+    /// Comma list: `en` and language names. Empty: all.
+    langs: Option<String>,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+async fn text_check(State(s): St, Path(ch): Path<String>, Query(q): Query<TextCheckQuery>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let (chapter, _) = s.chapter(&ch)?;
+    let font = match q.font.as_deref().filter(|f| !f.is_empty()) {
+        Some(f) => Some(text::Font::from_json(&store.read(store::asset_type("fonts")?, f)?["data"])?),
+        None => None,
+    };
+    let d = text::Limits::default();
+    let limits = text::Limits {
+        chars: q.chars.unwrap_or(d.chars),
+        face_chars: q.face_chars.unwrap_or(d.face_chars),
+        lines: q.lines.unwrap_or(d.lines),
+        px: q.px.unwrap_or(d.px),
+        face_px: q.face_px.unwrap_or(d.face_px),
+    };
+    let st = s.clone();
+    blocking(move || {
+        let lines = st.dialogue(&chapter.id, &store);
+        let langs = st.langs(&chapter.dir);
+        let only: Vec<String> = q
+            .langs
+            .unwrap_or_default()
+            .split(',')
+            .map(|x| x.trim().to_owned())
+            .filter(|x| !x.is_empty())
+            .collect();
+        let (items, coverage) = text::check_all(&lines, &langs, &limits, font.as_ref(), &only);
+        let total = items.len();
+        let page: Vec<_> = items.into_iter().skip(q.offset).take(q.limit.unwrap_or(500)).collect();
+        Ok(Json(json!({
+            "total": total, "offset": q.offset, "limits": limits, "languages": langs.keys().collect::<Vec<_>>(),
+            "coverage": coverage, "items": page,
+        })))
+    })
+    .await
+}
+
+/// Find and replace in all dialogue text. The changes are made again from the current code under the write lock.
+async fn text_replace(State(s): St, Path(ch): Path<String>, Json(r): Json<text::Replace>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let (chapter, _) = s.chapter(&ch)?;
+    let st = s.clone();
+    let out = blocking(move || {
+        let lines = st.dialogue(&chapter.id, &store);
+        let planned = r.changes(&lines)?;
+        if r.dry_run {
+            return Ok(json!({ "applied": false, "changes": planned, "codes": planned.iter().map(|c| &c.code).collect::<std::collections::BTreeSet<_>>().len() }));
+        }
+        let _w = st.write_lock();
+        let codes: std::collections::BTreeSet<String> = planned.iter().map(|c| c.code.clone()).collect();
+        let code_ty = store::asset_type("code")?;
+        let mut done = Vec::new();
+        let mut failed = Vec::new();
+        for name in codes {
+            let src = store.read(code_ty, &name)?["source"].as_str().unwrap_or_default().to_owned();
+            let changes = r.changes(&dialogue::scan_source(&name, &src))?;
+            if changes.is_empty() {
+                continue;
+            }
+            match store.patch_code(&name, &gml::rev(&src), &text::edits(&changes.iter().collect::<Vec<_>>())) {
+                Ok(_) => done.extend(changes),
+                Err(e) => failed.push(json!({ "code": name, "error": e.to_string() })),
+            }
+        }
+        Ok(json!({ "applied": true, "changes": done, "failed": failed }))
+    })
+    .await;
+    s.invalidate(&ch);
+    out.map(Json)
 }
 
 async fn get_enemies(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {

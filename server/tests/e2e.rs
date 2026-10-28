@@ -167,6 +167,35 @@ async fn extract_edit_build_roundtrip() {
     .await;
     assert_eq!(st, StatusCode::OK, "{live:#}");
 
+    // Wizards: every kind; the build compiles all of their GML.
+    let wizards = [
+        (
+            "npc",
+            json!({ "object": "obj_dre_npc", "speaker": "susie", "lines": ["* Hi.", "* Bye."], "place": { "room": "room0", "x": 64, "y": 64 } }),
+        ),
+        (
+            "shop",
+            json!({ "object": "obj_dre_shop", "items": [{ "name": "Candy", "item": 1, "price": 25 }], "place": { "room": "room0", "x": 96, "y": 64 } }),
+        ),
+        (
+            "enemy",
+            json!({ "object": "obj_dre_enemy", "name": "Blob", "hp": 30, "wave": "t1", "encounter": true, "x": 400, "y": 120 }),
+        ),
+        (
+            "room",
+            json!({ "name": "room_dre", "template": "room0", "markers": [{ "letter": "A", "x": 40, "y": 40 }],
+            "doors": [{ "letter": "A", "x": 0, "y": 100, "target": "room0" }], "creation_code": "x = 1;" }),
+        ),
+        (
+            "cutscene",
+            json!({ "object": "obj_dre_cs", "flag": 5, "place": { "room": "room0", "x": 0, "y": 0 } }),
+        ),
+    ];
+    for (kind, params) in wizards {
+        let (st, out) = call(&app, "POST", &format!("/api/chapters/chapter1/wizards/{kind}"), Some(params)).await;
+        assert_eq!(st, StatusCode::OK, "{kind}: {out:#}");
+    }
+
     let (_, j) = call(&app, "POST", "/api/chapters/chapter1/build", None).await;
     let job = wait_job(&app, j["job"].as_u64().unwrap()).await;
     assert_eq!(job["status"], "succeeded", "{job:#}");
@@ -185,6 +214,19 @@ async fn extract_edit_build_roundtrip() {
     assert!(gml.contains("* Modded./%") && gml.contains("x = 99"), "{gml}");
     let room: Value = serde_json::from_slice(&std::fs::read(check.join("p/rooms/room0.json")).unwrap()).unwrap();
     assert_eq!(room["GameObjects"][0]["X"], 200);
+    let names: Vec<&str> = room["GameObjects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["ObjectName"].as_str())
+        .collect();
+    assert_eq!(names, ["obj_talk", "obj_dre_npc", "obj_dre_shop", "obj_dre_cs"]);
+    let new_room: Value = serde_json::from_slice(&std::fs::read(check.join("p/rooms/room_dre.json")).unwrap()).unwrap();
+    assert_eq!(new_room["GameObjects"].as_array().unwrap().len(), 2);
+    let setup = std::fs::read_to_string(check.join("p/code/gml_Script_scr_monstersetup.gml")).unwrap();
+    assert!(setup.contains("case 2:") && setup.contains("30"), "{setup}");
+    let shop = std::fs::read_to_string(check.join("p/code/gml_Object_obj_dre_shop_Step_0.gml")).unwrap();
+    assert!(shop.contains("scr_itemget"), "{shop}");
     let wave: Value = serde_json::from_slice(&std::fs::read(check.join("p/objects/obj_dre_wave_t1.json")).unwrap()).unwrap();
     assert_eq!(wave["Events"].as_array().unwrap().len(), 2, "{wave:#}");
     let step = std::fs::read_to_string(check.join("p/code/gml_Object_obj_dre_wave_t1_Step_0.gml")).unwrap();

@@ -421,3 +421,103 @@ async fn export_lang_and_version_check() {
     let (st, _) = call(&app, "PUT", "/api/loader/mods", Some(json!([{ "id": "nope", "enabled": true }]))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn cutscene_put_checks_and_adds_sections() {
+    let (_t, app) = setup();
+    let uri = "/api/chapters/chapter1/cutscenes/gml_Object_obj_cs_Step_0";
+    let (_, cs) = call(&app, "GET", uri, None).await;
+    assert_eq!(cs["sections"][0]["con"], "1");
+    let b = &cs["blocks"][0];
+    let bad = json!({ "rev": cs["rev"], "blocks": [{ "start": b["start"], "end": b["end"], "indent": "    ", "steps": [{ "func": "c_wait", "args": ["1); x = (2"] }] }] });
+    let (st, _) = call(&app, "PUT", uri, Some(bad)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let good = json!({
+        "rev": cs["rev"],
+        "blocks": [{ "start": b["start"], "end": b["end"], "indent": "    ", "steps": [{ "func": "c_sel", "args": ["su"] }, { "func": "c_wait", "args": ["2"] }] }],
+        "sections": [{ "con": 2, "next": 3, "steps": [{ "func": "c_wait", "args": ["9"] }] }],
+    });
+    let (st, out) = call(&app, "PUT", uri, Some(good.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["source"],
+        "if (con == 1)\n{\n    c_sel(su);\n    c_wait(2);\n}\nif (con == 2)\n{\n    con = 3;\n    c_wait(9);\n}\n"
+    );
+    assert_eq!(out["sections"][1]["next"], json!(["3"]));
+    let (st, _) = call(&app, "PUT", uri, Some(good)).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn wizards_plan_apply() {
+    let (_t, app) = setup();
+    let base = "/api/chapters/chapter1/wizards";
+    let npc = json!({ "object": "obj_npc_w", "sprite": "spr_a", "lines": ["* Hi."] });
+    let (st, plan) = call(&app, "POST", &format!("{base}/npc?dry_run=true"), Some(npc.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{plan}");
+    assert_eq!(plan["applied"], false);
+    assert_eq!(plan["writes"].as_array().unwrap().len(), 3);
+    let (st, _) = call(&app, "GET", "/api/chapters/chapter1/assets/objects/obj_npc_w", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, plan) = call(&app, "POST", &format!("{base}/npc"), Some(npc.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{plan}");
+    let (_, obj) = call(&app, "GET", "/api/chapters/chapter1/assets/objects/obj_npc_w", None).await;
+    assert_eq!(obj["data"]["Sprite"], "spr_a");
+    // The dialogue index sees the new text (cache cleared).
+    let (_, dlg) = call(
+        &app,
+        "GET",
+        "/api/chapters/chapter1/dialogue?code=gml_Object_obj_npc_w_Step_0",
+        None,
+    )
+    .await;
+    assert_eq!(dlg["items"][0]["text"], "* Hi./%");
+    let (st, _) = call(&app, "POST", &format!("{base}/npc"), Some(npc)).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // Enemy: a new case in the stats switch.
+    let (st, out) = call(
+        &app,
+        "POST",
+        &format!("{base}/enemy"),
+        Some(json!({ "object": "obj_e_w", "parent": "", "name": "W", "hp": 7 })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let (_, en) = call(&app, "GET", "/api/chapters/chapter1/enemies", None).await;
+    let rec = en.as_array().unwrap().iter().find(|r| r["case"] == "2").unwrap();
+    assert_eq!(rec["fields"]["monstermaxhp"]["expr"], "7");
+    let (st, _) = call(&app, "POST", &format!("{base}/nothing"), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "POST", &format!("{base}/npc"), Some(json!({ "lines": [] }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn text_check_and_replace() {
+    let (_t, app) = setup();
+    let (st, r) = call(&app, "GET", "/api/chapters/chapter1/text/check?chars=4&face_chars=4", None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["total"], 1);
+    assert_eq!(r["items"][0]["problems"][0]["kind"], "width");
+    let (_, r) = call(&app, "GET", "/api/chapters/chapter1/text/check", None).await;
+    assert_eq!(r["total"], 0);
+    let rep = json!({ "find": "hi", "replace": "Yo", "ignore_case": true, "dry_run": true });
+    let (_, r) = call(&app, "POST", "/api/chapters/chapter1/text/replace", Some(rep)).await;
+    assert_eq!(r["changes"][0]["after"], "* Yo./%");
+    let (_, dlg) = call(&app, "GET", "/api/chapters/chapter1/dialogue", None).await;
+    assert_eq!(dlg["items"][0]["text"], "* Hi./%");
+    let rep = json!({ "find": "hi", "replace": "Yo", "ignore_case": true });
+    let (st, r) = call(&app, "POST", "/api/chapters/chapter1/text/replace", Some(rep)).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["changes"].as_array().unwrap().len(), 1);
+    let (_, dlg) = call(&app, "GET", "/api/chapters/chapter1/dialogue", None).await;
+    assert_eq!(dlg["items"][0]["text"], "* Yo./%");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/api/chapters/chapter1/text/replace",
+        Some(json!({ "find": "(", "regex": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
