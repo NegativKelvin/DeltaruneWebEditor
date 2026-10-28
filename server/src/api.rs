@@ -15,8 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chapters::{self, Chapter};
+use crate::cutscene;
 use crate::dialogue::{self, DialogueLine};
+use crate::enemies;
 use crate::error::{Error, Result};
+use crate::gml;
 use crate::jobs::Jobs;
 use crate::store::{self, ASSET_TYPES, ChapterStore};
 use crate::utmt::Utmt;
@@ -34,6 +37,21 @@ pub struct AppState {
     pub settings: RwLock<Settings>,
     pub jobs: Jobs,
     dialogue_cache: Mutex<HashMap<String, Arc<Vec<DialogueLine>>>>,
+    cutscene_cache: Mutex<HashMap<String, Arc<CutsceneList>>>,
+    enemy_cache: Mutex<HashMap<String, Arc<Vec<enemies::Record>>>>,
+}
+
+/// Code entries with `c_*` steps: (name, step count).
+type CutsceneList = Vec<(String, usize)>;
+
+/// Gets a per-chapter index from a cache, or builds it.
+fn cached<T>(cache: &Mutex<HashMap<String, Arc<T>>>, chapter: &str, build: impl FnOnce() -> T) -> Arc<T> {
+    if let Some(c) = cache.lock().unwrap().get(chapter) {
+        return c.clone();
+    }
+    let v = Arc::new(build());
+    cache.lock().unwrap().insert(chapter.to_owned(), v.clone());
+    v
 }
 
 type St = State<Arc<AppState>>;
@@ -45,6 +63,8 @@ impl AppState {
             settings: RwLock::new(settings),
             jobs: Jobs::default(),
             dialogue_cache: Mutex::default(),
+            cutscene_cache: Mutex::default(),
+            enemy_cache: Mutex::default(),
         })
     }
 
@@ -104,19 +124,17 @@ impl AppState {
 
     fn invalidate(&self, chapter: &str) {
         self.dialogue_cache.lock().unwrap().remove(chapter);
+        self.cutscene_cache.lock().unwrap().remove(chapter);
+        self.enemy_cache.lock().unwrap().remove(chapter);
     }
 
     fn dialogue(&self, chapter: &str, store: &ChapterStore) -> Arc<Vec<DialogueLine>> {
-        if let Some(c) = self.dialogue_cache.lock().unwrap().get(chapter) {
-            return c.clone();
-        }
-        let lines: Vec<DialogueLine> = store
-            .code_sources()
-            .flat_map(|(name, src)| dialogue::scan_source(&name, &src))
-            .collect();
-        let lines = Arc::new(lines);
-        self.dialogue_cache.lock().unwrap().insert(chapter.to_owned(), lines.clone());
-        lines
+        cached(&self.dialogue_cache, chapter, || {
+            store
+                .code_sources()
+                .flat_map(|(name, src)| dialogue::scan_source(&name, &src))
+                .collect()
+        })
     }
 }
 
@@ -144,7 +162,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/chapters/{ch}/assets/{ty}/{name}",
             get(get_asset).put(put_asset).delete(revert_asset),
         )
-        .route("/api/chapters/{ch}/assets/{ty}/{name}/files/{file}", get(get_file).put(put_file))
+        .route(
+            "/api/chapters/{ch}/assets/{ty}/{name}/files/{file}",
+            get(get_file).put(put_file).delete(delete_file),
+        )
+        .route("/api/chapters/{ch}/code/{name}/patch", post(patch_code))
+        .route("/api/chapters/{ch}/index/{ty}", get(asset_index))
+        .route("/api/chapters/{ch}/cutscenes", get(list_cutscenes))
+        .route("/api/chapters/{ch}/cutscenes/{code}", get(get_cutscene))
+        .route("/api/chapters/{ch}/enemies", get(get_enemies))
         .route("/api/chapters/{ch}/generic", get(generic_index))
         .route("/api/chapters/{ch}/generic/{list}", get(generic_list))
         .route("/api/chapters/{ch}/dialogue", get(get_dialogue))
@@ -279,6 +305,7 @@ struct ListQuery {
     limit: Option<usize>,
     code: Option<String>,
     max: Option<usize>,
+    fields: Option<String>,
 }
 
 async fn list_assets(State(s): St, Path((ch, ty)): Path<(String, String)>, Query(q): Query<ListQuery>) -> Result<Json<Value>> {
@@ -364,6 +391,89 @@ async fn put_file(State(s): St, Path((ch, ty, name, file)): Path<(String, String
         s.invalidate(&ch);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_file(State(s): St, Path((ch, ty, name, file)): Path<(String, String, String, String)>) -> Result<StatusCode> {
+    let store = s.extracted(&ch)?;
+    let ty = store::asset_type(&ty)?;
+    store.delete_file(ty, &name, &file)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PatchCode {
+    rev: String,
+    edits: Vec<gml::Edit>,
+}
+
+async fn patch_code(State(s): St, Path((ch, name)): Path<(String, String)>, Json(body): Json<PatchCode>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let out = store.patch_code(&name, &body.rev, &body.edits)?;
+    s.invalidate(&ch);
+    Ok(Json(out))
+}
+
+async fn asset_index(State(s): St, Path((ch, ty)): Path<(String, String)>, Query(q): Query<ListQuery>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let ty = store::asset_type(&ty)?;
+    let fields = q.fields.unwrap_or_default();
+    blocking(move || {
+        let f: Vec<&str> = fields.split(',').map(str::trim).filter(|x| !x.is_empty()).collect();
+        Ok(Json(json!(store.index(ty, &f))))
+    })
+    .await
+}
+
+async fn list_cutscenes(State(s): St, Path(ch): Path<String>, Query(q): Query<ListQuery>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let st = s.clone();
+    blocking(move || {
+        let all = cached(&st.cutscene_cache, &ch, || {
+            let mut v: Vec<(String, usize)> = store
+                .code_sources()
+                .map(|(name, src)| (name, cutscene::count(&src)))
+                .filter(|x| x.1 > 0)
+                .collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            v
+        });
+        let needle = q.q.map(|x| x.to_lowercase());
+        let items: Vec<Value> = all
+            .iter()
+            .filter(|(n, _)| needle.as_ref().is_none_or(|q| n.to_lowercase().contains(q)))
+            .map(|(n, c)| json!({ "code": n, "steps": c }))
+            .collect();
+        Ok(Json(json!({ "total": items.len(), "items": items })))
+    })
+    .await
+}
+
+async fn get_cutscene(State(s): St, Path((ch, code)): Path<(String, String)>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let asset = store.read(store::asset_type("code")?, &code)?;
+    let src = asset["source"].as_str().unwrap_or_default();
+    Ok(Json(json!({
+        "code": code,
+        "rev": asset["rev"],
+        "modified": asset["modified"],
+        "source": src,
+        "blocks": cutscene::blocks(src),
+    })))
+}
+
+async fn get_enemies(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let st = s.clone();
+    blocking(move || {
+        let recs = cached(&st.enemy_cache, &ch, || {
+            store
+                .code_sources()
+                .flat_map(|(name, src)| enemies::scan_source(&name, &src))
+                .collect()
+        });
+        Ok(Json(json!(*recs)))
+    })
+    .await
 }
 
 async fn generic_index(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {

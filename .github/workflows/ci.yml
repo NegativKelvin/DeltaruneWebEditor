@@ -28,3 +28,12 @@ jobs:
       - run: cargo test
         env:
           DRE_TEST_UTMT: ${{ runner.temp }}/utmt/UndertaleModCli
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check JavaScript syntax
+        run: for f in $(find web/js -name '*.js'); do echo "$f"; node --input-type=module --check < "$f"; done
