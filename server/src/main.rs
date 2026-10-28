@@ -1,11 +1,10 @@
 //! dre-server: local backend for the Deltarune web mod editor.
 
-use dre_server::{api, utmt};
+use dre_server::{api, guard, utmt};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use axum::response::IntoResponse;
 use clap::Parser;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -57,7 +56,8 @@ async fn main() -> std::io::Result<()> {
     let state = api::AppState::new(workspace, settings);
     let app = api::router(state)
         .fallback_service(ServeDir::new(&web))
-        .layer(axum::middleware::from_fn(local_host_only))
+        .layer(axum::middleware::from_fn(guard::same_site_writes))
+        .layer(axum::middleware::from_fn(guard::local_host_only))
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
@@ -74,19 +74,4 @@ fn near_exe(path: PathBuf) -> PathBuf {
         return p;
     }
     path
-}
-
-/// Blocks DNS-rebinding: only accept requests addressed to a loopback host name.
-async fn local_host_only(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
-    let host = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let name = host.rsplit_once(':').map_or(host, |(n, _)| n);
-    if matches!(name, "localhost" | "127.0.0.1" | "[::1]") {
-        next.run(req).await
-    } else {
-        (axum::http::StatusCode::FORBIDDEN, "host not allowed").into_response()
-    }
 }
