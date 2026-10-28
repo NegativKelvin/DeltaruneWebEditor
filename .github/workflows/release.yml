@@ -1,0 +1,86 @@
+name: release
+# Packages dre-server, the webpage, and a self-contained UndertaleModCli for each OS.
+# Tag `v*`: publishes a GitHub release. Pull request (packaging changes) or manual run: uploads artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/build-utmt.sh
+      - packaging/**
+      - server/src/main.rs
+      - server/src/utmt.rs
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
+          - { rid: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, exe: "" }
+          - { rid: osx-arm64, os: macos-latest, target: aarch64-apple-darwin, exe: "" }
+          - { rid: osx-x64, os: macos-latest, target: x86_64-apple-darwin, exe: "" }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PKG: DeltaruneWebEditor-${{ matrix.rid }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build dre-server
+        working-directory: server
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build UndertaleModCli
+        run: scripts/build-utmt.sh ${{ matrix.rid }} "$RUNNER_TEMP/utmt"
+      - name: Assemble package
+        run: |
+          mkdir -p "dist/$PKG/tools"
+          cp "server/target/${{ matrix.target }}/release/dre-server${{ matrix.exe }}" "dist/$PKG/"
+          cp -r web "dist/$PKG/web"
+          cp -r "$RUNNER_TEMP/utmt/UndertaleModCli" "dist/$PKG/tools/UndertaleModCli"
+          cp README.md packaging/THIRD-PARTY.md "dist/$PKG/"
+          cp "$RUNNER_TEMP"/utmt/UndertaleModTool-*-src.tar.gz dist/
+      - name: Smoke test (bundled CLI starts without an installed .NET)
+        if: matrix.rid != 'osx-x64'
+        run: DOTNET_ROOT=/nonexistent "dist/$PKG/tools/UndertaleModCli/UndertaleModCli${{ matrix.exe }}" --help
+      - name: End-to-end test with the bundled CLI
+        if: matrix.rid == 'linux-x64'
+        working-directory: server
+        run: DRE_TEST_UTMT="$GITHUB_WORKSPACE/dist/$PKG/tools/UndertaleModCli/UndertaleModCli" cargo test --locked --test e2e
+      - name: Archive
+        working-directory: dist
+        run: |
+          if [ "${{ matrix.rid }}" = win-x64 ]; then 7z a -tzip "$PKG.zip" "$PKG" > /dev/null; else tar -czf "$PKG.tar.gz" "$PKG"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

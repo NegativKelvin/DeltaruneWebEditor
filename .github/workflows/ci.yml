@@ -2,8 +2,6 @@ name: ci
 on:
   push:
   pull_request:
-env:
-  UTMT_TAG: 0.9.2.0
 jobs:
   server:
     runs-on: ubuntu-latest
@@ -18,16 +16,14 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Build UndertaleModCli
-        working-directory: ${{ runner.temp }}
-        run: |
-          git clone --depth 1 --branch "$UTMT_TAG" --recurse-submodules --shallow-submodules https://github.com/UnderminersTeam/UndertaleModTool utmt-src
-          dotnet publish utmt-src/UndertaleModCli -c Release -o utmt
+      - name: Build UndertaleModCli (pinned, same script as the release)
+        working-directory: .
+        run: scripts/build-utmt.sh linux-x64 "$RUNNER_TEMP/utmt"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
         env:
-          DRE_TEST_UTMT: ${{ runner.temp }}/utmt/UndertaleModCli
+          DRE_TEST_UTMT: ${{ runner.temp }}/utmt/UndertaleModCli/UndertaleModCli
   web:
     runs-on: ubuntu-latest
     steps:

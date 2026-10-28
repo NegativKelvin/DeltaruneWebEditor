@@ -6,13 +6,30 @@ serves every asset to the webpage (`web/`), stores edits, and builds a patched `
 
 Status: step 1 (backend), step 2 (editors), and step 3 (room preview, bullet patterns, battle box) are done. Build and one-click test launch come next.
 
-## Requirements
+## Download and run (no other downloads)
+
+1. Get `DeltaruneWebEditor-<os>` from [Releases](https://github.com/NegativKelvin/DeltaruneWebEditor/releases): `win-x64` (.zip), `linux-x64`, `osx-arm64`, `osx-x64` (.tar.gz).
+2. Extract it and start `dre-server` (`dre-server.exe` on Windows).
+3. Open <http://127.0.0.1:7878>, set the Deltarune folder in Setup, and extract the chapters.
+
+The package holds UndertaleModCli 0.9.2.0 in `tools/UndertaleModCli/`, built self-contained (it includes the .NET runtime), so you do not install UTMT or .NET.
+The server finds it automatically. macOS: the files are not signed; run `xattr -dr com.apple.quarantine DeltaruneWebEditor-osx-*` once.
+
+Make a release: push a tag `v*`. The [release workflow](.github/workflows/release.yml) builds each package and runs the end-to-end test with the bundled CLI (Linux).
+
+### UndertaleModTool license (GPL-3.0)
+
+UTMT is GPL-3.0. The package ships it unmodified as a separate program that `dre-server` starts as a child process (no linking),
+so the editor code keeps its own license. Each release also gives what GPL-3.0 needs for the CLI:
+its license text (`tools/UndertaleModCli/LICENSE.txt`), the notice [THIRD-PARTY.md](packaging/THIRD-PARTY.md),
+and the corresponding source `UndertaleModTool-0.9.2.0-src.tar.gz` as a release asset. Keep these when you share a package.
+
+## Build from source
 
 - Deltarune (Steam install: `data.win` plus `chapter1_windows/` ... `chapter4_windows/`).
-- UndertaleModCli **0.9.2.0 or later** (from the UTMT release zip, `UndertaleModCli.exe`). Earlier versions have no project export/build.
 - Rust 1.85+ to build the server.
-
-## Run
+- UndertaleModCli **0.9.2.0 or later**. Earlier versions have no project export/build. Build the pinned copy into `tools/` with git and the .NET 10 SDK:
+  `scripts/build-utmt.sh <win-x64|linux-x64|osx-arm64|osx-x64> tools` (Windows: Git Bash). Or use `UndertaleModCli.exe` from a UTMT build.
 
 ```sh
 cd server
@@ -24,9 +41,9 @@ Open <http://127.0.0.1:7878>. You can also set the paths later with `PUT /api/se
 | Flag | Env | Default |
 |---|---|---|
 | `--game` | `DRE_GAME_DIR` | from `settings.json` |
-| `--utmt` | `DRE_UTMT_CLI` | `settings.json`, then `./`, `./tools/`, next to the server, `PATH` |
+| `--utmt` | `DRE_UTMT_CLI` | `settings.json` (if the file is still there), then next to the server: `tools/UndertaleModCli/`, `tools/`, the server folder; then `./tools/UndertaleModCli/`, `./tools/`, `./`, `PATH` |
 | `--workspace` | `DRE_WORKSPACE` | `workspace` |
-| `--web` | `DRE_WEB_DIR` | `web` |
+| `--web` | `DRE_WEB_DIR` | `web` (in the current folder, else next to the server) |
 | `--listen` | `DRE_LISTEN` | `127.0.0.1:7878` |
 
 The server accepts only requests addressed to `localhost`/`127.0.0.1` (DNS-rebinding guard), and it sends no CORS headers.
@@ -144,4 +161,4 @@ DRE_TEST_UTMT=/path/to/UndertaleModCli cargo test  # plus the end-to-end test: e
 cd .. && node --test web/tests/*.test.mjs          # battle simulator and room preview rules
 ```
 
-The end-to-end test makes a small data file with [tests/fixtures/make_fixture.csx](server/tests/fixtures/make_fixture.csx). CI builds UTMT 0.9.2.0 from source and runs all tests.
+The end-to-end test makes a small data file with [tests/fixtures/make_fixture.csx](server/tests/fixtures/make_fixture.csx). CI builds UTMT 0.9.2.0 from source with `scripts/build-utmt.sh` and runs all tests.

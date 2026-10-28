@@ -46,21 +46,34 @@ async fn main() -> std::io::Result<()> {
     if args.utmt.is_some() {
         settings.utmt_cli = args.utmt;
     }
-    if settings.utmt_cli.is_none() {
+    // A saved path goes stale when the release folder moves: find the CLI again.
+    if !settings.utmt_cli.as_ref().is_some_and(|c| c.is_file()) {
         settings.utmt_cli = utmt::locate_cli();
     }
+    let web = near_exe(args.web);
     tracing::info!(?settings, workspace = %workspace.display(), "starting");
     std::fs::write(workspace.join("settings.json"), serde_json::to_vec_pretty(&settings)?)?;
 
     let state = api::AppState::new(workspace, settings);
     let app = api::router(state)
-        .fallback_service(ServeDir::new(&args.web))
+        .fallback_service(ServeDir::new(&web))
         .layer(axum::middleware::from_fn(local_host_only))
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("listening on http://{}", args.listen);
     axum::serve(listener, app).await
+}
+
+/// Uses `<server folder>/<path>` when a relative path is not in the current directory (release zip started from elsewhere).
+fn near_exe(path: PathBuf) -> PathBuf {
+    if path.is_relative()
+        && !path.exists()
+        && let Some(p) = utmt::exe_dir().map(|d| d.join(&path)).filter(|p| p.exists())
+    {
+        return p;
+    }
+    path
 }
 
 /// Blocks DNS-rebinding: only accept requests addressed to a loopback host name.
