@@ -67,8 +67,11 @@ export async function attempt(fn, okMsg) {
   }
 }
 
-/** Modal dialog. buttons: [{label, value, primary}]. Resolves with the value of the pressed button (null on Escape). */
-export function modal(title, body, buttons = [{ label: 'OK', value: true, primary: true }]) {
+/**
+ * Modal dialog. buttons: [{label, value, primary}]. Resolves with the value of the pressed button (null on Escape).
+ * `onOpen(close)`: called once it shows; `close(v)` ends it with the value v (for a pick inside the body).
+ */
+export function modal(title, body, buttons = [{ label: 'OK', value: true, primary: true }], onOpen) {
   return new Promise((resolve) => {
     const close = (v) => {
       back.remove();
@@ -92,6 +95,7 @@ export function modal(title, body, buttons = [{ label: 'OK', value: true, primar
     document.addEventListener('keydown', onKey, true);
     const first = back.querySelector('input,select,textarea');
     (first || back.querySelector('button.primary'))?.focus();
+    onOpen?.(close);
   });
 }
 
