@@ -11,6 +11,8 @@ use crate::jobs::Jobs;
 use crate::store::ChapterStore;
 
 pub const EXPORT_SCRIPT: &str = include_str!("../utmt-scripts/export_all.csx");
+/// A run that takes longer is stopped. Normal extracts and builds take minutes.
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct Utmt {
@@ -51,7 +53,20 @@ impl Utmt {
         };
         let out = pipe(Box::new(child.stdout.take().unwrap()), jobs.clone());
         let err = pipe(Box::new(child.stderr.take().unwrap()), jobs.clone());
-        let status = child.wait().await.map_err(|e| e.to_string())?;
+        let cancel = jobs.cancel_signal(job).unwrap_or_default();
+        let stop = tokio::select! {
+            status = child.wait() => Ok(status.map_err(|e| e.to_string())?),
+            () = cancel.notified() => Err("cancelled"),
+            () = tokio::time::sleep(RUN_TIMEOUT) => Err("timed out"),
+        };
+        let status = match stop {
+            Ok(status) => status,
+            Err(why) => {
+                let _ = child.kill().await;
+                let _ = tokio::join!(out, err);
+                return Err(format!("UndertaleModCli {why}; it was stopped"));
+            }
+        };
         let _ = tokio::join!(out, err);
         if status.success() {
             Ok(())
@@ -199,5 +214,22 @@ mod tests {
         replace_dir(&new, &dst).await.unwrap();
         assert_eq!(std::fs::read_to_string(dst.join("project.json")).unwrap(), "new");
         assert!(!tmp.path().join("base.old").exists() && !new.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_stops_the_cli() {
+        let jobs = Jobs::default();
+        let job = jobs.start("build", "c").unwrap();
+        let utmt = Utmt { cli: "sleep".into() };
+        let j = jobs.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            j.cancel(job);
+        });
+        let started = std::time::Instant::now();
+        let r = utmt.run(&jobs, job, Path::new("."), &["30".as_ref()], &[]).await;
+        assert!(r.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

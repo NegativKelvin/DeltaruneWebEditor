@@ -306,37 +306,45 @@ impl ChapterStore {
 
     /// Writes asset JSON (and gml source for code) into mod/.
     pub fn write(&self, ty: &AssetType, name: &str, data: Option<Value>, source: Option<String>) -> Result<Value> {
-        let path = self.ensure_in_mod(ty, name)?;
-        if let Some(mut data) = data {
-            let obj = data
-                .as_object_mut()
-                .ok_or_else(|| Error::BadRequest("data must be a JSON object".into()))?;
-            match obj.get("$type").and_then(Value::as_str) {
-                None => {
-                    obj.insert("$type".into(), Value::String(ty.json_type.into()));
-                }
-                Some(t) if t != ty.json_type => {
-                    return Err(Error::BadRequest(format!("$type '{t}' does not match '{}'", ty.json_type)));
-                }
-                Some(_) => {}
-            }
-            // `$type` must stay the first key for System.Text.Json polymorphic reads.
-            let t = obj.remove("$type").unwrap();
-            let mut ordered = serde_json::Map::with_capacity(obj.len() + 1);
-            ordered.insert("$type".into(), t);
-            ordered.append(obj);
-            data = Value::Object(ordered);
-            std::fs::write(&path, serde_json::to_vec_pretty(&data)?)?;
-        } else if !Self::exists(&path, ty) && !(ty.slug == "code" && source.is_some()) {
+        // Check everything before the first write, so a bad request changes nothing.
+        validate_name(name)?;
+        if source.is_some() && ty.slug != "code" {
+            return Err(Error::BadRequest("'source' is only for code assets".into()));
+        }
+        let data = data.map(|d| Self::ordered(ty, d)).transpose()?;
+        if data.is_none() && !(ty.slug == "code" && source.is_some()) && self.resolve(ty, name).is_err() {
             return Err(Error::BadRequest(format!("new asset needs 'data' ($type {})", ty.json_type)));
         }
+        let path = self.ensure_in_mod(ty, name)?;
+        if let Some(data) = data {
+            std::fs::write(&path, serde_json::to_vec_pretty(&data)?)?;
+        }
         if let Some(src) = source {
-            if ty.slug != "code" {
-                return Err(Error::BadRequest("'source' is only for code assets".into()));
-            }
             std::fs::write(path.with_extension("gml"), src)?;
         }
         self.read(ty, name)
+    }
+
+    /// Checks `$type` of asset JSON and puts it first.
+    fn ordered(ty: &AssetType, mut data: Value) -> Result<Value> {
+        let obj = data
+            .as_object_mut()
+            .ok_or_else(|| Error::BadRequest("data must be a JSON object".into()))?;
+        match obj.get("$type").and_then(Value::as_str) {
+            None => {
+                obj.insert("$type".into(), Value::String(ty.json_type.into()));
+            }
+            Some(t) if t != ty.json_type => {
+                return Err(Error::BadRequest(format!("$type '{t}' does not match '{}'", ty.json_type)));
+            }
+            Some(_) => {}
+        }
+        // `$type` must stay the first key for System.Text.Json polymorphic reads.
+        let t = obj.remove("$type").unwrap();
+        let mut ordered = serde_json::Map::with_capacity(obj.len() + 1);
+        ordered.insert("$type".into(), t);
+        ordered.append(obj);
+        Ok(Value::Object(ordered))
     }
 
     /// Path of a side file, mod first then base.
@@ -587,6 +595,16 @@ mod tests {
         s.write(rooms, "room_new", Some(json!({"Width": 1})), None).unwrap();
         let e = s.list(rooms).into_iter().find(|e| e.name == "room_new").unwrap();
         assert!(e.added && e.modified);
+    }
+
+    #[test]
+    fn bad_write_changes_nothing() {
+        let (_t, s) = setup();
+        let rooms = asset_type("rooms").unwrap();
+        assert!(s.write(rooms, "room_town", Some(json!({"Width": 1})), Some("x".into())).is_err());
+        assert!(s.write(rooms, "room_town", Some(json!({"$type": "Sprite"})), None).is_err());
+        assert!(!s.mod_dir().join("rooms/room_town.json").exists());
+        assert_eq!(s.read(rooms, "room_town").unwrap()["data"]["Width"], 320);
     }
 
     #[test]

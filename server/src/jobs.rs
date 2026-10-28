@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use tokio::sync::Notify;
 
 const MAX_LOG_LINES: usize = 2000;
 /// Finished jobs to keep. Older ones are removed when a new job starts.
@@ -26,6 +27,9 @@ pub struct Job {
     pub status: JobStatus,
     pub error: Option<String>,
     pub log: Vec<String>,
+    /// Set by `cancel`. The UTMT run waits on it.
+    #[serde(skip)]
+    cancel: Arc<Notify>,
 }
 
 #[derive(Default, Clone)]
@@ -58,6 +62,7 @@ impl Jobs {
                 status: JobStatus::Running,
                 error: None,
                 log: Vec::new(),
+                cancel: Arc::default(),
             },
         );
         Some(id)
@@ -82,6 +87,22 @@ impl Jobs {
                 }
             }
         }
+    }
+
+    /// Asks a running job to stop. Returns false if the job is not running.
+    pub fn cancel(&self, id: u64) -> bool {
+        match self.jobs.lock().unwrap().get(&id) {
+            Some(j) if j.status == JobStatus::Running => {
+                j.cancel.notify_one();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Signal that `cancel` sends for this job.
+    pub fn cancel_signal(&self, id: u64) -> Option<Arc<Notify>> {
+        self.jobs.lock().unwrap().get(&id).map(|j| j.cancel.clone())
     }
 
     pub fn get(&self, id: u64) -> Option<Job> {
@@ -119,7 +140,19 @@ mod tests {
         let job = jobs.get(a).unwrap();
         assert_eq!(job.status, JobStatus::Failed);
         assert_eq!(job.log, ["hello"]);
+        assert!(!jobs.cancel(a));
         assert!(jobs.start("build", "chapter1").is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_wakes_the_job() {
+        let jobs = Jobs::default();
+        let a = jobs.start("extract", "c").unwrap();
+        let signal = jobs.cancel_signal(a).unwrap();
+        assert!(jobs.cancel(a));
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal.notified())
+            .await
+            .unwrap();
     }
 
     #[test]
