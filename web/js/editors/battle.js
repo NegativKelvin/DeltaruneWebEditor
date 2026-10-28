@@ -1,7 +1,7 @@
 // Bullet pattern and battle box editor. Edit emitters and box keyframes, and see the wave at once:
 // scrub the timeline, or test it with the soul (arrows, X or Shift to go slow). Patterns are kept on the server,
 // made into GML for a wave object, and installed into the mod (obj_dre_wave_<name>).
-import { h, add, clear, toast, attempt, modal, confirmDialog, promptDialog, assetDatalist, loadImage } from '../ui.js';
+import { h, add, clear, toast, attempt, modal, promptDialog, assetDatalist, loadImage } from '../ui.js';
 import { api } from '../api.js';
 import { setDirtyCheck } from '../app.js';
 import { SCREEN_W, SCREEN_H, DEFAULT_EMITTER, normalize, createSim, simulateTo, boxAt } from './battlesim.js';
@@ -143,8 +143,12 @@ export async function render(main, ctx) {
     drawSide();
   }
   async function remove() {
-    if (!name || !(await confirmDialog(`Delete pattern ${name}? An installed wave object stays in the mod until you revert it.`, 'Delete'))) return;
-    if (await attempt(() => api.del(`${pbase}/${enc(name)}`), 'Deleted')) { saved = JSON.stringify(pat); setDirtyCheck(null); go(''); }
+    if (!name) return;
+    const how = await modal(`Delete pattern ${name}?`, h('p', null, 'An installed wave object can stay in the mod, or go with the pattern.'),
+      [{ label: 'Cancel', value: null }, { label: 'Delete with wave object', value: 'all' }, { label: 'Delete, keep wave object', value: 'keep', primary: true }]);
+    if (!how) return;
+    const q = how === 'all' ? '?uninstall=true' : '';
+    if (await attempt(() => api.del(`${pbase}/${enc(name)}${q}`), 'Deleted')) { saved = JSON.stringify(pat); setDirtyCheck(null); go(''); }
   }
   async function duplicate() {
     const n = await promptDialog('Name of the copy', name ? `${name}_copy` : 'wave1');

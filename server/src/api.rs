@@ -45,6 +45,8 @@ pub struct AppState {
     epoch: AtomicU64,
     /// Chapter dir -> lang files (read again when a file changes).
     lang_cache: Mutex<HashMap<PathBuf, (dialogue::LangStamp, Arc<dialogue::Langs>)>>,
+    /// Held while an asset is changed, so a patch cannot check its rev while another write runs.
+    write_lock: Mutex<()>,
 }
 
 /// Code entries with `c_*` steps: (name, step count).
@@ -77,7 +79,12 @@ impl AppState {
             enemy_cache: Mutex::default(),
             epoch: AtomicU64::new(0),
             lang_cache: Mutex::default(),
+            write_lock: Mutex::default(),
         })
+    }
+
+    fn write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn settings_path(&self) -> PathBuf {
@@ -178,6 +185,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/asset-types", get(|| async { Json(ASSET_TYPES) }))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}", get(get_job))
+        .route("/api/jobs/{id}/cancel", post(cancel_job))
         .route("/api/chapters", get(list_chapters))
         .route("/api/chapters/{ch}/extract", post(extract))
         .route("/api/chapters/{ch}/build", post(build))
@@ -227,6 +235,15 @@ async fn put_settings(State(s): St, Json(new): Json<Settings>) -> Result<Json<Se
     {
         return Err(Error::BadRequest(format!("utmt_cli '{}' is not a file", c.display())));
     }
+    // The API writes files only in the workspace. A CLI there could be a file sent through the API.
+    if let Some(c) = &new.utmt_cli
+        && std::fs::canonicalize(c)?.starts_with(std::fs::canonicalize(&s.workspace).unwrap_or_else(|_| s.workspace.clone()))
+    {
+        return Err(Error::BadRequest(format!(
+            "utmt_cli '{}' is in the workspace; use a file outside it",
+            c.display()
+        )));
+    }
     let merged = {
         let mut cur = s.settings.write().unwrap();
         if new.game_dir.is_some() {
@@ -248,6 +265,14 @@ async fn list_jobs(State(s): St) -> impl IntoResponse {
 
 async fn get_job(State(s): St, Path(id): Path<u64>) -> Result<impl IntoResponse> {
     s.jobs.get(id).map(Json).ok_or_else(|| Error::NotFound(format!("job {id}")))
+}
+
+async fn cancel_job(State(s): St, Path(id): Path<u64>) -> Result<StatusCode> {
+    if s.jobs.cancel(id) {
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Err(Error::Conflict(format!("job {id} is not running")))
+    }
 }
 
 async fn list_chapters(State(s): St) -> Result<Json<Vec<Value>>> {
@@ -376,7 +401,10 @@ async fn put_asset(State(s): St, Path((ch, ty, name)): Path<(String, String, Str
     if body.data.is_none() && body.source.is_none() {
         return Err(Error::BadRequest("give 'data' and/or 'source'".into()));
     }
-    let out = store.write(ty, &name, body.data, body.source)?;
+    let out = {
+        let _w = s.write_lock();
+        store.write(ty, &name, body.data, body.source)?
+    };
     if ty.slug == "code" {
         s.invalidate(&ch);
     }
@@ -386,7 +414,10 @@ async fn put_asset(State(s): St, Path((ch, ty, name)): Path<(String, String, Str
 async fn revert_asset(State(s): St, Path((ch, ty, name)): Path<(String, String, String)>) -> Result<StatusCode> {
     let store = s.extracted(&ch)?;
     let ty = store::asset_type(&ty)?;
-    store.revert(ty, &name)?;
+    {
+        let _w = s.write_lock();
+        store.revert(ty, &name)?;
+    }
     if ty.slug == "code" {
         s.invalidate(&ch);
     }
@@ -419,7 +450,10 @@ async fn get_file(State(s): St, Path((ch, ty, name, file)): Path<(String, String
 async fn put_file(State(s): St, Path((ch, ty, name, file)): Path<(String, String, String, String)>, body: Bytes) -> Result<StatusCode> {
     let store = s.extracted(&ch)?;
     let ty = store::asset_type(&ty)?;
-    store.write_file(ty, &name, &file, &body)?;
+    {
+        let _w = s.write_lock();
+        store.write_file(ty, &name, &file, &body)?;
+    }
     if ty.slug == "code" {
         s.invalidate(&ch);
     }
@@ -429,7 +463,10 @@ async fn put_file(State(s): St, Path((ch, ty, name, file)): Path<(String, String
 async fn delete_file(State(s): St, Path((ch, ty, name, file)): Path<(String, String, String, String)>) -> Result<StatusCode> {
     let store = s.extracted(&ch)?;
     let ty = store::asset_type(&ty)?;
-    store.delete_file(ty, &name, &file)?;
+    {
+        let _w = s.write_lock();
+        store.delete_file(ty, &name, &file)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -441,7 +478,10 @@ struct PatchCode {
 
 async fn patch_code(State(s): St, Path((ch, name)): Path<(String, String)>, Json(body): Json<PatchCode>) -> Result<Json<Value>> {
     let store = s.extracted(&ch)?;
-    let out = store.patch_code(&name, &body.rev, &body.edits)?;
+    let out = {
+        let _w = s.write_lock();
+        store.patch_code(&name, &body.rev, &body.edits)?
+    };
     s.invalidate(&ch);
     Ok(Json(out))
 }
@@ -589,9 +629,25 @@ async fn put_pattern(State(s): St, Path((ch, name)): Path<(String, String)>, Jso
     Ok(Json(pat))
 }
 
-async fn delete_pattern(State(s): St, Path((ch, name)): Path<(String, String)>) -> Result<StatusCode> {
+#[derive(Deserialize)]
+struct DeletePattern {
+    /// Also remove the installed wave object and its code from the mod.
+    #[serde(default)]
+    uninstall: bool,
+}
+
+async fn delete_pattern(State(s): St, Path((ch, name)): Path<(String, String)>, Query(q): Query<DeletePattern>) -> Result<StatusCode> {
     let store = s.extracted(&ch)?;
     PatternStore::new(&store).delete(&name)?;
+    if q.uninstall {
+        let st = s.clone();
+        blocking(move || {
+            let _w = st.write_lock();
+            patterns::uninstall(&store, &name)
+        })
+        .await?;
+        s.invalidate(&ch);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -620,7 +676,12 @@ async fn install_pattern(State(s): St, Path((ch, name)): Path<(String, String)>,
     let store = s.extracted(&ch)?;
     let pat = body_or_saved(&store, &name, &body)?;
     PatternStore::new(&store).write(&name, &pat)?;
-    let out = blocking(move || patterns::install(&store, &name, &pat)).await?;
+    let st = s.clone();
+    let out = blocking(move || {
+        let _w = st.write_lock();
+        patterns::install(&store, &name, &pat)
+    })
+    .await?;
     s.invalidate(&ch);
     Ok(Json(out))
 }

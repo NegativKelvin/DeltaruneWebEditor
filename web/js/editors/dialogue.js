@@ -78,15 +78,24 @@ export async function render(main, ctx) {
     const byCode = new Map();
     for (const [i, text] of edits) {
       const it = data.items[i];
-      if (!byCode.has(it.code)) byCode.set(it.code, { rev: it.rev, edits: [] });
+      if (!byCode.has(it.code)) byCode.set(it.code, { rev: it.rev, edits: [], rows: [] });
       byCode.get(it.code).edits.push({ start: it.span[0], end: it.span[1], string: text });
+      byCode.get(it.code).rows.push(i);
     }
-    let n = 0;
+    let n = 0, saved = 0;
     for (const [codeName, p] of byCode) {
-      if (await attempt(() => capi.patchCode(codeName, p.rev, p.edits))) n += p.edits.length;
+      if (!(await attempt(() => capi.patchCode(codeName, p.rev, p.edits)))) continue;
+      n += p.edits.length;
+      saved++;
+      for (const i of p.rows) edits.delete(i);
+    }
+    if (edits.size) {
+      // Keep the lines that were not saved, so the text is not lost. Saved rows now have a new rev: reload before you change them again.
+      toast(`Saved ${n} lines in ${saved} code entries. ${edits.size} lines are not saved.`, 'error');
+      saveAll.textContent = `Save changes (${edits.size})`;
+      return;
     }
     toast(`Saved ${n} lines in ${byCode.size} code entries`, 'ok');
-    edits.clear();
     load();
   }
 

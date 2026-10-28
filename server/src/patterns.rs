@@ -624,17 +624,51 @@ pub fn install(store: &ChapterStore, name: &str, pat: &Pattern) -> Result<Value>
         .as_object_mut()
         .ok_or_else(|| Error::Other(format!("{} is not a JSON object", g.object)))?;
     // Keep events of other kinds that a user added.
-    let ours = |e: &Value| {
-        let cat = e.get("Category").and_then(Value::as_str);
-        cat == Some("Create") || (cat == Some("Step") && e.get("Subtype").and_then(Value::as_str) == Some("Step"))
-    };
     let mut all: Vec<Value> = events.as_array().unwrap().clone();
     if let Some(old) = obj.get("Events").and_then(Value::as_array) {
-        all.extend(old.iter().filter(|e| !ours(e)).cloned());
+        all.extend(old.iter().filter(|e| !is_wave_event(e)).cloned());
     }
     obj.insert("Events".into(), Value::Array(all));
     store.write(objects, &g.object, Some(data), None)?;
     Ok(json!({ "object": g.object, "code": [g.create_code, g.step_code] }))
+}
+
+/// Removes what `install` wrote: the two code entries, and the Create and Step events of the wave object.
+/// The object goes away when it has no other events. Returns the names that were removed or changed.
+pub fn uninstall(store: &ChapterStore, name: &str) -> Result<Vec<String>> {
+    validate_pattern_name(name)?;
+    let object = wave_object(name);
+    let code = store::asset_type("code")?;
+    let objects = store::asset_type("objects")?;
+    let mut done = Vec::new();
+    for c in [format!("gml_Object_{object}_Create_0"), format!("gml_Object_{object}_Step_0")] {
+        if store.list(code).iter().any(|e| e.name == c && e.modified) {
+            store.revert(code, &c)?;
+            done.push(c);
+        }
+    }
+    if store.list(objects).iter().any(|e| e.name == object && e.modified) {
+        let mut data = store.read(objects, &object)?["data"].clone();
+        let others: Vec<Value> = data
+            .get("Events")
+            .and_then(Value::as_array)
+            .map(|ev| ev.iter().filter(|e| !is_wave_event(e)).cloned().collect())
+            .unwrap_or_default();
+        if others.is_empty() {
+            store.revert(objects, &object)?;
+        } else if let Some(obj) = data.as_object_mut() {
+            obj.insert("Events".into(), Value::Array(others));
+            store.write(objects, &object, Some(data), None)?;
+        }
+        done.push(object);
+    }
+    Ok(done)
+}
+
+/// Create, or Step/Step: the events that `install` writes.
+fn is_wave_event(e: &Value) -> bool {
+    let cat = e.get("Category").and_then(Value::as_str);
+    cat == Some("Create") || (cat == Some("Step") && e.get("Subtype").and_then(Value::as_str) == Some("Step"))
 }
 
 /// A new object with every field that UTMT import reads (it fails on a missing `PhysicsVertices`).
@@ -830,5 +864,32 @@ mod tests {
         assert_eq!(obj["Events"].as_array().unwrap().len(), 2);
         ps.delete("ring").unwrap();
         assert!(ps.read("ring").is_err());
+        // Uninstall: object with only wave events goes away, with its code.
+        assert_eq!(uninstall(&cs, "ring").unwrap().len(), 3);
+        assert!(!cs.mod_dir().join("objects/obj_dre_wave_ring.json").exists());
+        assert!(!cs.mod_dir().join("code/gml_Object_obj_dre_wave_ring_Step_0.gml").exists());
+        assert!(uninstall(&cs, "ring").unwrap().is_empty());
+    }
+
+    #[test]
+    fn uninstall_keeps_other_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cs = ChapterStore::new(tmp.path(), "chapter1");
+        std::fs::create_dir_all(cs.base().join("objects")).unwrap();
+        std::fs::write(cs.base().join("project.json"), r#"{"Name":"D"}"#).unwrap();
+        install(&cs, "ring", &Pattern::default()).unwrap();
+        let objects = store::asset_type("objects").unwrap();
+        let mut data = cs.read(objects, "obj_dre_wave_ring").unwrap()["data"].clone();
+        data["Events"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "Category": "Destroy", "Subtype": "", "CodeEntry": "x" }));
+        cs.write(objects, "obj_dre_wave_ring", Some(data), None).unwrap();
+        uninstall(&cs, "ring").unwrap();
+        let obj = cs.read(objects, "obj_dre_wave_ring").unwrap();
+        assert_eq!(
+            obj["data"]["Events"],
+            json!([{ "Category": "Destroy", "Subtype": "", "CodeEntry": "x" }])
+        );
     }
 }

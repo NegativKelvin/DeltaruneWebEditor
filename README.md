@@ -112,12 +112,13 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | Method | Path | Result |
 |---|---|---|
 | GET | `/api/health` | version |
-| GET/PUT | `/api/settings` | `{game_dir, utmt_cli}` |
+| GET/PUT | `/api/settings` | `{game_dir, utmt_cli}`. `utmt_cli` must be outside the workspace |
 | GET | `/api/asset-types` | the 12 editable types: slug, `$type`, own-directory flag |
 | GET | `/api/chapters` | chapters found in `game_dir`: `launcher`, `chapter1`, ... with `extracted` and `meta` |
 | POST | `/api/chapters/{ch}/extract` | `202 {job}` |
 | POST | `/api/chapters/{ch}/build` | `202 {job}` |
 | GET | `/api/jobs`, `/api/jobs/{id}` | status `running`/`succeeded`/`failed`, error, log lines |
+| POST | `/api/jobs/{id}/cancel` | stops the UndertaleModCli run of a running job (`409` if not running). A run also stops after 2 hours |
 | GET | `/api/chapters/{ch}/assets` | count per type |
 | GET | `/api/chapters/{ch}/assets/{type}?q=&offset=&limit=` | `{total, items:[{name, modified, added}]}` |
 | GET | `/api/chapters/{ch}/assets/{type}/{name}` | `{data, files, modified}`; code also has `source` (GML) |
@@ -136,7 +137,7 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | GET | `/api/chapters/{ch}/cutscenes/{code}` | `{rev, source, blocks:[{start, end, line, indent, context, steps:[{func, args, line, start, end}]}]}` |
 | GET | `/api/chapters/{ch}/enemies` | `global.monster*[i] = v` and `global.battlemsg[i] = v` assignments: `[{code, case, index, rev, fields:{name: {expr, start, end, line}}}]` |
 | GET | `/api/chapters/{ch}/patterns` | saved bullet patterns: `[{name, duration, emitters, object}]` |
-| GET/PUT/DELETE | `/api/chapters/{ch}/patterns/{name}` | one pattern (JSON, missing fields get defaults). Kept in `workspace/{ch}/patterns/`, not in the mod |
+| GET/PUT/DELETE | `/api/chapters/{ch}/patterns/{name}` | one pattern (JSON, missing fields get defaults). Kept in `workspace/{ch}/patterns/`, not in the mod. `DELETE ...?uninstall=true` also removes the installed wave object and its code from `mod/` |
 | POST | `/api/chapters/{ch}/patterns/{name}/gml` | body: a pattern, or empty for the saved one. `{object, create:{code, source}, step:{code, source}}` |
 | POST | `/api/chapters/{ch}/patterns/{name}/install` | saves the body (if any), writes the wave object and its two code entries into `mod/` |
 

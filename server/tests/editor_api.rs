@@ -199,4 +199,40 @@ async fn bullet_patterns() {
     assert_eq!(st, StatusCode::NO_CONTENT);
     let (st, _) = call(&app, "GET", &format!("{base}/w1"), None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+    // Plain delete keeps the wave object; delete with uninstall removes it.
+    let obj_uri = "/api/chapters/chapter1/assets/objects/obj_dre_wave_w1";
+    let (st, _) = call(&app, "GET", obj_uri, None).await;
+    assert_eq!(st, StatusCode::OK);
+    call(&app, "POST", &format!("{base}/w2/install"), Some(json!({}))).await;
+    let (st, _) = call(&app, "DELETE", &format!("{base}/w2?uninstall=true"), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = call(&app, "GET", "/api/chapters/chapter1/assets/objects/obj_dre_wave_w2", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn utmt_cli_not_in_workspace() {
+    let (t, app) = setup();
+    // A file sent through the API lands in the workspace; it must not become the CLI.
+    let (st, _) = call(&app, "PUT", "/api/chapters/chapter1/assets/sprites/spr_a/files/spr_a_0.png", None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let inside = t.path().join("ws/chapter1/mod/sprites/spr_a/spr_a_0.png");
+    let (st, _) = call(&app, "PUT", "/api/settings", Some(json!({ "utmt_cli": inside }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let outside = t.path().join("game/chapter1_windows/data.win");
+    let (st, s) = call(&app, "PUT", "/api/settings", Some(json!({ "utmt_cli": outside }))).await;
+    assert_eq!(st, StatusCode::OK, "{s}");
+    let (st, _) = call(&app, "POST", "/api/jobs/99/cancel", None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn bad_put_changes_nothing() {
+    let (_t, app) = setup();
+    let uri = "/api/chapters/chapter1/assets/objects/obj_cs";
+    let (st, _) = call(&app, "PUT", uri, Some(json!({ "data": { "Visible": true }, "source": "x" }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, obj) = call(&app, "GET", uri, None).await;
+    assert_eq!(obj["modified"], false);
+    assert_eq!(obj["data"]["Visible"], false);
 }
