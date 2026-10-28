@@ -256,7 +256,9 @@ impl ChapterStore {
         });
         if ty.slug == "code" {
             let gml = path.with_extension("gml");
-            out["source"] = Value::String(std::fs::read_to_string(gml).unwrap_or_default());
+            let src = std::fs::read_to_string(gml).unwrap_or_default();
+            out["rev"] = Value::String(crate::gml::rev(&src));
+            out["source"] = Value::String(src);
         }
         Ok(out)
     }
@@ -365,6 +367,44 @@ impl ChapterStore {
         }
         std::fs::write(json.parent().unwrap().join(file), bytes)?;
         Ok(())
+    }
+
+    /// Removes a side file from the mod copy of an asset. The base file stays, but reads no longer see it.
+    pub fn delete_file(&self, ty: &AssetType, name: &str, file: &str) -> Result<()> {
+        validate_name(file)?;
+        if file.ends_with(".json") || (ty.slug == "code" && file.ends_with(".gml")) {
+            return Err(Error::BadRequest("delete the asset through the asset endpoint".into()));
+        }
+        self.file_path(ty, name, file)?;
+        let json = self.ensure_in_mod(ty, name)?;
+        std::fs::remove_file(json.parent().unwrap().join(file))?;
+        Ok(())
+    }
+
+    /// Changes byte ranges of a code source. `rev` must be the revision the offsets come from.
+    pub fn patch_code(&self, name: &str, rev: &str, edits: &[crate::gml::Edit]) -> Result<Value> {
+        let ty = asset_type("code")?;
+        let cur = self.read(ty, name)?;
+        let src = cur["source"].as_str().unwrap_or_default();
+        if crate::gml::rev(src) != rev {
+            return Err(Error::Conflict(format!("code '{name}' changed; reload it and try again")));
+        }
+        let new = crate::gml::apply_edits(src, edits)?;
+        self.write(ty, name, None, Some(new))
+    }
+
+    /// Selected top-level fields of every asset of one type: name -> {field: value}.
+    pub fn index(&self, ty: &AssetType, fields: &[&str]) -> BTreeMap<String, Value> {
+        self.list(ty)
+            .into_iter()
+            .filter_map(|e| {
+                let (path, _) = self.resolve(ty, &e.name).ok()?;
+                let v: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+                let picked: serde_json::Map<String, Value> =
+                    fields.iter().filter_map(|f| Some(((*f).to_owned(), v.get(*f)?.clone()))).collect();
+                Some((e.name, Value::Object(picked)))
+            })
+            .collect()
     }
 
     /// Removes an asset from mod/ (revert to base, or delete a new asset).
@@ -547,6 +587,37 @@ mod tests {
         s.write(rooms, "room_new", Some(json!({"Width": 1})), None).unwrap();
         let e = s.list(rooms).into_iter().find(|e| e.name == "room_new").unwrap();
         assert!(e.added && e.modified);
+    }
+
+    #[test]
+    fn patch_delete_index() {
+        let (_t, s) = setup();
+        let code = asset_type("code").unwrap();
+        let cur = s.read(code, "gml_Object_obj_a_Create_0").unwrap();
+        let rev = cur["rev"].as_str().unwrap().to_owned();
+        let edit = crate::gml::Edit {
+            start: 4,
+            end: 5,
+            text: Some("7".into()),
+            string: None,
+        };
+        let out = s
+            .patch_code("gml_Object_obj_a_Create_0", &rev, std::slice::from_ref(&edit))
+            .unwrap();
+        assert!(out["source"].as_str().unwrap().starts_with("x = 7;"));
+        assert!(matches!(
+            s.patch_code("gml_Object_obj_a_Create_0", &rev, &[edit]),
+            Err(Error::Conflict(_))
+        ));
+
+        let spr = asset_type("sprites").unwrap();
+        s.delete_file(spr, "spr_kris", "spr_kris_0.png").unwrap();
+        assert_eq!(s.read(spr, "spr_kris").unwrap()["files"], json!([]));
+        assert!(s.base().join("sprites/spr_kris/spr_kris_0.png").is_file());
+        assert!(s.delete_file(spr, "spr_kris", "spr_kris.json").is_err());
+
+        let idx = s.index(asset_type("rooms").unwrap(), &["Width", "Nope"]);
+        assert_eq!(idx["room_town"], json!({"Width": 320}));
     }
 
     #[test]

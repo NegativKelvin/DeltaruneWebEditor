@@ -7,6 +7,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::gml::{self, Tok};
+
 /// Text-bearing functions. `loc` variants take a localization key as the last argument.
 /// The value is the argument index of the text.
 const TEXT_FUNCS: &[(&str, usize)] = &[
@@ -35,197 +37,60 @@ pub struct DialogueLine {
     pub line: usize,
     pub func: String,
     pub text: Option<String>,
+    /// Byte range of the text literal in the source, for edits.
+    pub span: Option<[usize; 2]>,
     pub key: Option<String>,
     pub speaker: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Arg {
-    Str(String),
-    Expr(String),
-}
-
-/// Reads a GML string literal at `s[i] == '"'` (or `@"`/`@'` verbatim). Returns (value, end index).
-fn read_string(s: &[char], mut i: usize) -> Option<(String, usize)> {
-    let verbatim = s[i] == '@';
-    if verbatim {
-        i += 1;
-    }
-    let quote = *s.get(i)?;
-    if quote != '"' && !(verbatim && quote == '\'') {
-        return None;
-    }
-    i += 1;
-    let mut out = String::new();
-    while i < s.len() {
-        let c = s[i];
-        if c == quote {
-            return Some((out, i + 1));
-        }
-        if c == '\\' && !verbatim {
-            i += 1;
-            match s.get(i)? {
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                other => out.push(*other),
-            }
-        } else {
-            out.push(c);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Parses a call argument list that starts after `(`. Returns (args, index after `)`).
-fn read_args(s: &[char], mut i: usize) -> Option<(Vec<Arg>, usize)> {
-    let mut args = Vec::new();
-    let mut cur = String::new();
-    let mut only_str: Option<String> = None;
-    let mut depth = 0usize;
-    let flush = |cur: &mut String, only_str: &mut Option<String>, args: &mut Vec<Arg>| {
-        let t = cur.trim();
-        if !t.is_empty() {
-            args.push(match only_str.take() {
-                Some(v) if t.starts_with('"') || t.starts_with('@') => Arg::Str(v),
-                _ => Arg::Expr(t.to_owned()),
-            });
-        }
-        cur.clear();
-        *only_str = None;
-    };
-    while i < s.len() {
-        let c = s[i];
-        if c == '"' || (c == '@' && matches!(s.get(i + 1), Some('"' | '\''))) {
-            let (v, end) = read_string(s, i)?;
-            let lone = depth == 0 && cur.trim().is_empty();
-            cur.extend(&s[i..end]);
-            only_str = if lone { Some(v) } else { None };
-            i = end;
-            continue;
-        }
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' if depth > 0 => depth -= 1,
-            ')' => {
-                flush(&mut cur, &mut only_str, &mut args);
-                return Some((args, i + 1));
-            }
-            ',' if depth == 0 => {
-                flush(&mut cur, &mut only_str, &mut args);
-                i += 1;
-                continue;
-            }
-            _ => {}
-        }
-        if !c.is_whitespace() {
-            // Anything after the string literal makes this an expression.
-            if only_str.is_some() {
-                only_str = None;
-            }
-        }
-        cur.push(c);
-        i += 1;
-    }
-    None
-}
-
-fn is_ident(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    /// Revision of the source the spans refer to.
+    pub rev: String,
 }
 
 /// Finds dialogue calls in one GML source.
 pub fn scan_source(code: &str, src: &str) -> Vec<DialogueLine> {
-    let s: Vec<char> = src.chars().collect();
+    let toks = gml::tokenize(src);
+    let rev = gml::rev(src);
     let mut out = Vec::new();
     let mut speaker: Option<String> = None;
-    let mut line = 1usize;
-    let mut i = 0usize;
-    while i < s.len() {
-        let c = s[i];
-        if c == '\n' {
-            line += 1;
-            i += 1;
+    for k in 0..toks.len() {
+        let Some(ident) = toks[k].ident() else { continue };
+        if !toks.get(k + 1).is_some_and(|t| t.is_punct('(')) || (k > 0 && toks[k - 1].is_punct('.')) {
             continue;
         }
-        // Skip comments and strings outside calls.
-        if c == '/' && s.get(i + 1) == Some(&'/') {
-            while i < s.len() && s[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && s.get(i + 1) == Some(&'*') {
-            i += 2;
-            while i + 1 < s.len() && !(s[i] == '*' && s[i + 1] == '/') {
-                if s[i] == '\n' {
-                    line += 1;
-                }
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        if c == '"' {
-            match read_string(&s, i) {
-                Some((v, end)) => {
-                    line += v.matches('\n').count();
-                    i = end;
-                }
-                None => i += 1,
-            }
-            continue;
-        }
-        if !(is_ident(c) && (i == 0 || !is_ident(s[i - 1]))) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < s.len() && is_ident(s[i]) {
-            i += 1;
-        }
-        let ident: String = s[start..i].iter().collect();
-        let mut j = i;
-        while j < s.len() && s[j] == ' ' {
-            j += 1;
-        }
-        if s.get(j) != Some(&'(') {
-            continue;
-        }
-        let call_line = line;
-        let is_speaker = SPEAKER_FUNCS.contains(&ident.as_str());
+        let is_speaker = SPEAKER_FUNCS.contains(&ident);
         let text_func = TEXT_FUNCS.iter().find(|(n, _)| *n == ident);
         if !is_speaker && text_func.is_none() {
             continue;
         }
-        let Some((args, end)) = read_args(&s, j + 1) else {
-            continue;
-        };
-        line += s[i..end].iter().filter(|&&c| c == '\n').count();
-        i = end;
-        let as_str = |a: Option<&Arg>| match a {
-            Some(Arg::Str(v)) => Some(v.clone()),
+        let Some(close) = gml::matching(&toks, k + 1) else { continue };
+        let args = gml::split_args(&toks, k + 1, close);
+        // A lone string literal argument: (value, byte span).
+        let lit = |a: Option<&(usize, usize)>| match a {
+            Some(&(x, y)) if y == x + 1 => match &toks[x].tok {
+                Tok::Str(v) => Some((v.clone(), [toks[x].start, toks[x].end])),
+                _ => None,
+            },
             _ => None,
         };
         if is_speaker {
-            speaker = as_str(args.first());
+            speaker = lit(args.first()).map(|x| x.0);
             continue;
         }
         let (name, text_idx) = *text_func.unwrap();
         let localized = name.ends_with("loc") || name == "scr_84_get_lang_string";
-        let key = if localized { as_str(args.last()) } else { None };
-        let text = as_str(args.get(text_idx));
+        let key = if localized { lit(args.last()).map(|x| x.0) } else { None };
+        let text = lit(args.get(text_idx));
         if text.is_none() && key.is_none() {
             continue;
         }
         out.push(DialogueLine {
             code: code.to_owned(),
-            line: call_line,
+            line: toks[k].line,
             func: name.into(),
-            text,
+            span: text.as_ref().map(|x| x.1),
+            text: text.map(|x| x.0),
             key,
             speaker: speaker.clone(),
+            rev: rev.clone(),
         });
     }
     out
@@ -285,6 +150,8 @@ msgset(0, "* Plain./%");
         assert_eq!(lines[3].text, None);
         assert_eq!(lines[4].key, None);
         assert_eq!(lines[4].line, 8);
+        let [a, b] = lines[0].span.unwrap();
+        assert_eq!(&src[a..b], r#""\"Hey,\" Kris./""#);
     }
 
     #[test]

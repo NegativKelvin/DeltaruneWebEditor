@@ -4,7 +4,7 @@ A modding tool for Deltarune that runs in a webpage. A local Rust server (`serve
 [UndertaleModTool](https://github.com/UnderminersTeam/UndertaleModTool) CLI to decompile each chapter,
 serves every asset to the webpage (`web/`), stores edits, and builds a patched `data.win`.
 
-Status: step 1 (backend and data layer) is done. Editors, live preview, and one-click launch come next.
+Status: step 1 (backend) and step 2 (editors) are done. Live room preview, bullet pattern and battle box editors, and one-click launch come next.
 
 ## Requirements
 
@@ -30,6 +30,33 @@ Open <http://127.0.0.1:7878>. You can also set the paths later with `PUT /api/se
 | `--listen` | `DRE_LISTEN` | `127.0.0.1:7878` |
 
 The server accepts only requests addressed to `localhost`/`127.0.0.1` (DNS-rebinding guard), and it sends no CORS headers.
+
+## Editors (webpage)
+
+The webpage is plain HTML, CSS, and JavaScript modules in `web/` (no build step). The browser cannot run the Rust code,
+and a WebAssembly build adds a toolchain for no gain here, so all parsing stays in the Rust server and the page only draws and edits.
+
+| Editor | What you can do |
+|---|---|
+| Setup | Set the game folder and UndertaleModCli path. Extract each chapter. |
+| Overview and build | Asset counts, list of changes (revert each), build `data.win` with the log. |
+| Rooms and triggers | Draws background colour, backgrounds, tile layers, asset layers, legacy tiles, and instances (old and GMS2 layer rooms). Select, drag, nudge, add, duplicate, delete instances. Paint and erase tiles. Edit instance creation code (trigger settings) and room creation code inline. Triggers list: door, marker, event, and invisible objects, and instances with creation code. Layer, view, and room properties. Undo/redo. |
+| Dialogue | All text lines from GML with speaker, key, translations, and a text box preview (`\cY` colours, `^1` pauses, `/` `%`). Edit text: only the string literal changes. |
+| Cutscenes | Code entries with `c_*` calls, shown as blocks of steps. Change function and arguments, add, delete, reorder. Saving replaces only the changed blocks. |
+| Sprites | Pixel editor (pencil, eraser, fill, colour picker, flip), frames (add, copy, delete, reorder, import PNG or strip, export strip), resize, origin, bounding box, collision kind, animation preview. Automatic bounding box and collision masks are made on save. |
+| Enemies and encounters | Stats from `global.monster*[i] = ...` assignments (`scr_monstersetup`), encounters (`scr_encountersetup`: enemy object, type, position, battle text), links to enemy objects. |
+| Shaders | Edit every shader text file. Live WebGL preview of the GLSL ES pair on a sprite, with a control for each uniform. Replace compiled `.bin` data. |
+| All assets | Every type (rooms, objects, code, scripts, sprites, backgrounds, sounds, fonts, shaders, paths, sequences, animation curves): form editor for all fields, raw JSON, side files (preview, replace, add, remove), new, duplicate, revert. Objects: events with inline code, add events. Paths: drag points. Code: GML editor with highlighting. |
+| Data lists | Read-only tree view of every list in the data file. |
+| Search code | Plain-text search in all GML, links to the line. |
+
+Shortcuts: Ctrl+S saves. Room: V select, A add, T paint, X erase, Del delete, Ctrl+D duplicate, arrows nudge, Space or middle button pans, wheel zooms.
+Sprite: B pencil, E eraser, G fill, I colour picker, O origin, arrows change frame.
+
+Known limits:
+- Windows Deltarune draws shaders with the compiled HLSL11 data. After you change GLSL ES, compile HLSL 11 (`fxc`, `vs_4_0` / `ps_4_0`) and replace `HLSL11_*.bin` in the shader editor.
+- Translations in `lang/*.json` are read-only here (they are not in `data.win`). Step 4 (deploy) copies changed language files.
+- The enemy and cutscene views read decompiled GML. Values that the decompiler writes as numbers (for example an object index) show as numbers.
 
 ## How data flows
 
@@ -68,6 +95,12 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | GET | `/api/chapters/{ch}/generic/{list}?q=&offset=&limit=` | items of one list (`GeneralInfo`, `Options`, `Language` return one object) |
 | GET | `/api/chapters/{ch}/dialogue?q=&code=&offset=&limit=` | dialogue lines (see below) |
 | GET | `/api/chapters/{ch}/search?q=&max=` | plain-text search in all GML |
+| DELETE | `/api/chapters/{ch}/assets/{type}/{name}/files/{file}` | remove a side file from the mod copy |
+| POST | `/api/chapters/{ch}/code/{name}/patch` | body `{rev, edits:[{start, end, text?, string?}]}`: replace byte ranges of the GML. `string` is quoted as a GML string. `409` if `rev` is old |
+| GET | `/api/chapters/{ch}/index/{type}?fields=A,B` | `{name: {A, B}}` for every asset of a type (for example object sprites) |
+| GET | `/api/chapters/{ch}/cutscenes?q=` | code entries with `c_*` steps and the step count |
+| GET | `/api/chapters/{ch}/cutscenes/{code}` | `{rev, source, blocks:[{start, end, line, indent, context, steps:[{func, args, line, start, end}]}]}` |
+| GET | `/api/chapters/{ch}/enemies` | `global.monster*[i] = v` and `global.battlemsg[i] = v` assignments: `[{code, case, index, rev, fields:{name: {expr, start, end, line}}}]` |
 
 Asset types (`{type}`): `rooms`, `objects`, `code`, `scripts`, `sprites`, `backgrounds`, `sounds`, `fonts`, `shaders`,
 `paths`, `sequences`, `animcurves`. The `data` JSON is the UTMT project format, so every field that UTMT can import can be changed.
@@ -76,9 +109,10 @@ Asset types (`{type}`): `rooms`, `objects`, `code`, `scripts`, `sprites`, `backg
 
 The server scans all GML for `msgsetloc`, `msgnextloc`, `msgsetsubloc`, `msgnextsubloc`, `c_msg*` variants, `stringsetloc`,
 `stringsetsubloc`, `msgset`, `msgnext`, `stringset`, and `scr_84_get_lang_string`. Each line has
-`{code, line, func, text, key, speaker, translations}`. `speaker` comes from the last `scr_speaker`/`c_speaker` call in the same code entry.
+`{code, line, func, text, span, key, speaker, rev, translations}`. `speaker` comes from the last `scr_speaker`/`c_speaker` call in the same code entry.
 `translations` come from `<chapter dir>/lang/lang_*.json` (for example `ja`).
-To change a line, change the GML with `PUT .../assets/code/{code}` and `source`.
+To change a line, `POST .../code/{code}/patch` with `{rev, edits:[{start: span[0], end: span[1], string: "new text"}]}`.
+Code reads (`GET .../assets/code/{name}`) also return `rev`.
 
 ## Tests
 
