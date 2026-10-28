@@ -211,3 +211,34 @@ tr.sel td { background: #2a2a10; }
   .split { grid-template-columns: 1fr; }
   .side { width: 100%; }
 }
+
+/* Room preview */
+.play { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.play-canvas canvas { outline: none; }
+.play-side { width: 300px; }
+.play-log { font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+.play-ev { border-left: 3px solid var(--line); padding-left: 6px; word-break: break-word; }
+.play-ev.room { border-color: var(--accent2); }
+.play-ev.trigger { border-color: #ff4fd8; }
+.play-ev.talk { border-color: var(--accent); }
+.play-ev pre { white-space: pre-wrap; max-height: 200px; overflow: auto; background: var(--bg); padding: 4px; margin: 4px 0; }
+.play-dlg { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); width: min(90%, 580px); }
+.play-dlg .dlg-box { max-width: none; }
+.play-window { position: fixed; right: 16px; bottom: 16px; width: min(960px, 70vw); height: min(640px, 70vh); min-width: 360px; min-height: 260px;
+  z-index: 50; background: var(--panel); border: 1px solid var(--accent); border-radius: 6px; display: flex; flex-direction: column; resize: both; overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6); }
+.play-window.max { inset: 52px 8px 8px 8px !important; width: auto; height: auto; resize: none; }
+.play-title { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: var(--panel2); cursor: move; user-select: none; border-bottom: 1px solid var(--line); }
+.play-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* Battle editor */
+.battle { display: flex; gap: 0; height: calc(100vh - 110px); min-height: 0; }
+.battle-stage { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.battle-stage .canvas-wrap { min-height: 240px; }
+.battle-side { width: 400px; }
+.timeline { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: var(--panel); border-top: 1px solid var(--line); }
+.timeline input[type=range] { flex: 1; }
+.emitter { border-left: 3px solid var(--accent2); }
+.emitter.off { opacity: 0.55; }
+.emitter .fields .field input[type=number] { width: 68px; }
+.gml-out { white-space: pre; max-height: 50vh; overflow: auto; background: var(--bg); padding: 8px; font-size: 12px; }

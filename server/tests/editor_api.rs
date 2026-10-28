@@ -155,3 +155,48 @@ async fn enemies_index_and_files() {
     assert_eq!(spr["files"], json!(["spr_a_0.png"]));
     assert_eq!(spr["modified"], true);
 }
+
+#[tokio::test]
+async fn bullet_patterns() {
+    let (_t, app) = setup();
+    let base = "/api/chapters/chapter1/patterns";
+    let (_, list) = call(&app, "GET", base, None).await;
+    assert_eq!(list, json!([]));
+    let (st, _) = call(&app, "PUT", &format!("{base}/bad%2Fname"), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(&app, "PUT", &format!("{base}/w1"), Some(json!({ "emitters": [{ "interval": 0 }] }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, p) = call(
+        &app,
+        "PUT",
+        &format!("{base}/w1"),
+        Some(json!({ "duration": 50, "emitters": [{ "count": 2 }] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(p["emitters"][0]["interval"], 20);
+    let (_, list) = call(&app, "GET", base, None).await;
+    assert_eq!(list[0]["name"], "w1");
+    // GML of an unsaved body, and of the saved pattern.
+    let (st, g) = call(&app, "POST", &format!("{base}/w1/gml"), Some(json!({ "duration": 7 }))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(g["step"]["source"].as_str().unwrap().contains("if (dre_t > 7)"));
+    let (_, g) = call(&app, "POST", &format!("{base}/w1/gml"), None).await;
+    assert!(g["step"]["source"].as_str().unwrap().contains("if (dre_t > 50)"));
+    let (st, r) = call(&app, "POST", &format!("{base}/w1/install"), None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (_, obj) = call(&app, "GET", "/api/chapters/chapter1/assets/objects/obj_dre_wave_w1", None).await;
+    assert_eq!(obj["data"]["Events"][1]["CodeEntry"], "gml_Object_obj_dre_wave_w1_Step_0");
+    let (_, code) = call(
+        &app,
+        "GET",
+        "/api/chapters/chapter1/assets/code/gml_Object_obj_dre_wave_w1_Step_0",
+        None,
+    )
+    .await;
+    assert!(code["source"].as_str().unwrap().contains("instance_create"));
+    let (st, _) = call(&app, "DELETE", &format!("{base}/w1"), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = call(&app, "GET", &format!("{base}/w1"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

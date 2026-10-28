@@ -93,7 +93,10 @@ async fn extract_edit_build_roundtrip() {
     assert_eq!(job["status"], "succeeded", "{job:#}");
 
     let (_, objects) = call(&app, "GET", "/api/chapters/chapter1/assets/objects", None).await;
-    assert_eq!(objects["items"][0]["name"], "obj_talk");
+    assert!(
+        objects["items"].as_array().unwrap().iter().any(|o| o["name"] == "obj_talk"),
+        "{objects:#}"
+    );
     let (_, dlg) = call(&app, "GET", "/api/chapters/chapter1/dialogue", None).await;
     assert_eq!(dlg["items"][0]["text"], "* Hey^1, Kris./%");
     assert_eq!(dlg["items"][0]["speaker"], "susie");
@@ -123,6 +126,23 @@ async fn extract_edit_build_roundtrip() {
     .await;
     assert_eq!(st, StatusCode::OK);
 
+    // Bullet pattern: save, install the wave object (the build compiles its GML).
+    let pattern = json!({
+        "duration": 90,
+        "box_code": true,
+        "box_keys": [{ "frame": 30, "x": 320, "y": 170, "w": 300, "h": 100 }],
+        "emitters": [
+            { "count": 6, "spread": 360, "aim": true, "gravity": 0.2, "jitter_x": 4, "jitter_angle": 3, "speed_step": 0.5,
+              "rotate": true, "scale": 2, "damage": 3, "life": 60, "on_spawn": "image_alpha = 0.5;" },
+            { "origin": "soul", "count": 1 },
+        ],
+    });
+    let (st, _) = call(&app, "PUT", "/api/chapters/chapter1/patterns/t1", Some(pattern)).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, inst) = call(&app, "POST", "/api/chapters/chapter1/patterns/t1/install", None).await;
+    assert_eq!(st, StatusCode::OK, "{inst:#}");
+    assert_eq!(inst["object"], "obj_dre_wave_t1");
+
     let (_, j) = call(&app, "POST", "/api/chapters/chapter1/build", None).await;
     let job = wait_job(&app, j["job"].as_u64().unwrap()).await;
     assert_eq!(job["status"], "succeeded", "{job:#}");
@@ -141,4 +161,8 @@ async fn extract_edit_build_roundtrip() {
     assert!(gml.contains("* Modded./%") && gml.contains("x = 99"), "{gml}");
     let room: Value = serde_json::from_slice(&std::fs::read(check.join("p/rooms/room0.json")).unwrap()).unwrap();
     assert_eq!(room["GameObjects"][0]["X"], 200);
+    let wave: Value = serde_json::from_slice(&std::fs::read(check.join("p/objects/obj_dre_wave_t1.json")).unwrap()).unwrap();
+    assert_eq!(wave["Events"].as_array().unwrap().len(), 2, "{wave:#}");
+    let step = std::fs::read_to_string(check.join("p/code/gml_Object_obj_dre_wave_t1_Step_0.gml")).unwrap();
+    assert!(step.contains("instance_create") && step.contains("dre_t"), "{step}");
 }

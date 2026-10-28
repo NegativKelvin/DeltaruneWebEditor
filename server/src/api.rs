@@ -21,6 +21,7 @@ use crate::enemies;
 use crate::error::{Error, Result};
 use crate::gml;
 use crate::jobs::Jobs;
+use crate::patterns::{self, Pattern, PatternStore};
 use crate::store::{self, ASSET_TYPES, ChapterStore};
 use crate::utmt::Utmt;
 
@@ -175,6 +176,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chapters/{ch}/generic/{list}", get(generic_list))
         .route("/api/chapters/{ch}/dialogue", get(get_dialogue))
         .route("/api/chapters/{ch}/search", get(search))
+        .route("/api/chapters/{ch}/patterns", get(list_patterns))
+        .route(
+            "/api/chapters/{ch}/patterns/{name}",
+            get(get_pattern).put(put_pattern).delete(delete_pattern),
+        )
+        .route("/api/chapters/{ch}/patterns/{name}/gml", post(pattern_gml))
+        .route("/api/chapters/{ch}/patterns/{name}/install", post(install_pattern))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
@@ -538,4 +546,56 @@ async fn search(State(s): St, Path(ch): Path<String>, Query(q): Query<ListQuery>
             .ok_or_else(|| Error::BadRequest("q is required".into()))?;
     let max = q.max.unwrap_or(500).min(5000);
     blocking(move || Ok(Json(json!(store.search_code(&needle, max))))).await
+}
+
+async fn list_patterns(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    Ok(Json(json!(PatternStore::new(&store).list())))
+}
+
+async fn get_pattern(State(s): St, Path((ch, name)): Path<(String, String)>) -> Result<Json<Pattern>> {
+    let store = s.extracted(&ch)?;
+    Ok(Json(PatternStore::new(&store).read(&name)?))
+}
+
+async fn put_pattern(State(s): St, Path((ch, name)): Path<(String, String)>, Json(pat): Json<Pattern>) -> Result<Json<Pattern>> {
+    let store = s.extracted(&ch)?;
+    PatternStore::new(&store).write(&name, &pat)?;
+    Ok(Json(pat))
+}
+
+async fn delete_pattern(State(s): St, Path((ch, name)): Path<(String, String)>) -> Result<StatusCode> {
+    let store = s.extracted(&ch)?;
+    PatternStore::new(&store).delete(&name)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Body: a pattern (not saved yet), or empty for the saved one.
+fn body_or_saved(store: &ChapterStore, name: &str, body: &Bytes) -> Result<Pattern> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        PatternStore::new(store).read(name)
+    } else {
+        Ok(serde_json::from_slice(body)?)
+    }
+}
+
+async fn pattern_gml(State(s): St, Path((ch, name)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let pat = body_or_saved(&store, &name, &body)?;
+    let g = patterns::to_gml(&name, &pat)?;
+    Ok(Json(json!({
+        "object": g.object,
+        "create": { "code": g.create_code, "source": g.create },
+        "step": { "code": g.step_code, "source": g.step },
+    })))
+}
+
+/// Saves the pattern (when a body is sent) and writes its wave object into the mod.
+async fn install_pattern(State(s): St, Path((ch, name)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    let pat = body_or_saved(&store, &name, &body)?;
+    PatternStore::new(&store).write(&name, &pat)?;
+    let out = blocking(move || patterns::install(&store, &name, &pat)).await?;
+    s.invalidate(&ch);
+    Ok(Json(out))
 }

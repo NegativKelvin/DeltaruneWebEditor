@@ -4,7 +4,7 @@ A modding tool for Deltarune that runs in a webpage. A local Rust server (`serve
 [UndertaleModTool](https://github.com/UnderminersTeam/UndertaleModTool) CLI to decompile each chapter,
 serves every asset to the webpage (`web/`), stores edits, and builds a patched `data.win`.
 
-Status: step 1 (backend) and step 2 (editors) are done. Live room preview, bullet pattern and battle box editors, and one-click launch come next.
+Status: step 1 (backend), step 2 (editors), and step 3 (room preview, bullet patterns, battle box) are done. Build and one-click test launch come next.
 
 ## Requirements
 
@@ -49,6 +49,23 @@ and a WebAssembly build adds a toolchain for no gain here, so all parsing stays 
 | All assets | Every type (rooms, objects, code, scripts, sprites, backgrounds, sounds, fonts, shaders, paths, sequences, animation curves): form editor for all fields, raw JSON, side files (preview, replace, add, remove), new, duplicate, revert. Objects: events with inline code, add events. Paths: drag points. Code: GML editor with highlighting. |
 | Data lists | Read-only tree view of every list in the data file. |
 | Search code | Plain-text search in all GML, links to the line. |
+
+## Test without the game
+
+| Tool | What you can do |
+|---|---|
+| Room preview | Walk Kris through a room in the browser. **▶ Play** (P) in the room editor opens it in a window over the editor: it uses the unsaved room, so a moved instance or painted tile shows at once. Also a page (`Test › Room preview`) for saved rooms. Solid objects (`obj_solid*` and their children, or the Solid flag) block. Triggers (doors, markers, events, invisible objects, instances with creation code) light up when Kris touches them, and the log shows their creation code. Doors: the room names in the door code (and in `room == <this room>` branches) give the next room; `obj_doorX` puts Kris on `obj_markerX` there. Z talks: the dialogue lines of the object show in a text box. Camera from the first view. Dark world toggle (2× Kris, `_dark` sprites), walk/run speed, show solids, no clip, sprite animation. |
+| Bullet patterns and battle box | Emitters with timing (start, end, every), origin (box, soul, screen), offset, random offset, ring radius, count, angle, spread, spin per shot, aim at the soul, random angle, speed, speed per bullet, acceleration, turn, gravity, life, sprite, scale, rotation, damage, and GML to run on each new bullet. Presets: ring, aimed burst, rain, spiral, side wall, falling arcs. Battle box: centre and size, keyframes over time. Timeline: play, pause, step, scrub, speed, loop. **Test with soul** (T): arrows move, X or Shift slow, with hits, i-frames, grazes, and HP. Every edit shows at once. |
+| GML export | **GML** shows the wave object code. **Install in mod** writes `obj_dre_wave_<name>` (Create and Step events) and its code into the mod. Start the wave from enemy attack code: `instance_create(0, 0, obj_dre_wave_<name>);`. Build the chapter after each install. |
+
+The simulator (`web/js/editors/battlesim.js`) runs the same steps in the same order as the made GML: box keys, bullet update (life, speed, turn), emitters, then GameMaker motion (gravity, position).
+The GML uses the Deltarune names `camerax()`, `cameray()`, `instance_create`, `obj_heart` (soul), `obj_growtangle` (box), and `obj_collidebullet` (default bullet object, you can change it).
+
+Known limits of step 3:
+- The preview does not run GML. Cutscenes, enemy AI, and object code that moves things do not run. Door targets that the game sets at run time (for example from global variables) show as "no target found".
+- Kris collides with the lower part of the sprite box. The game uses the masks of `obj_mainchara`.
+- The battle test uses circles for hits. The game uses sprite masks, its own damage rules, and its own soul speed.
+- "Write box code" (move and resize `obj_growtangle` by the keyframes) is experimental: the box object can also change its own size.
 
 Shortcuts: Ctrl+S saves. Room: V select, A add, T paint, X erase, Del delete, Ctrl+D duplicate, arrows nudge, Space or middle button pans, wheel zooms.
 Sprite: B pencil, E eraser, G fill, I colour picker, O origin, arrows change frame.
@@ -101,6 +118,10 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | GET | `/api/chapters/{ch}/cutscenes?q=` | code entries with `c_*` steps and the step count |
 | GET | `/api/chapters/{ch}/cutscenes/{code}` | `{rev, source, blocks:[{start, end, line, indent, context, steps:[{func, args, line, start, end}]}]}` |
 | GET | `/api/chapters/{ch}/enemies` | `global.monster*[i] = v` and `global.battlemsg[i] = v` assignments: `[{code, case, index, rev, fields:{name: {expr, start, end, line}}}]` |
+| GET | `/api/chapters/{ch}/patterns` | saved bullet patterns: `[{name, duration, emitters, object}]` |
+| GET/PUT/DELETE | `/api/chapters/{ch}/patterns/{name}` | one pattern (JSON, missing fields get defaults). Kept in `workspace/{ch}/patterns/`, not in the mod |
+| POST | `/api/chapters/{ch}/patterns/{name}/gml` | body: a pattern, or empty for the saved one. `{object, create:{code, source}, step:{code, source}}` |
+| POST | `/api/chapters/{ch}/patterns/{name}/install` | saves the body (if any), writes the wave object and its two code entries into `mod/` |
 
 Asset types (`{type}`): `rooms`, `objects`, `code`, `scripts`, `sprites`, `backgrounds`, `sounds`, `fonts`, `shaders`,
 `paths`, `sequences`, `animcurves`. The `data` JSON is the UTMT project format, so every field that UTMT can import can be changed.
@@ -119,7 +140,8 @@ Code reads (`GET .../assets/code/{name}`) also return `rev`.
 ```sh
 cd server
 cargo test                                         # unit tests
-DRE_TEST_UTMT=/path/to/UndertaleModCli cargo test  # plus the end-to-end test: extract, edit, build, verify
+DRE_TEST_UTMT=/path/to/UndertaleModCli cargo test  # plus the end-to-end test: extract, edit, install a pattern, build, verify
+cd .. && node --test web/tests/*.test.mjs          # battle simulator and room preview rules
 ```
 
 The end-to-end test makes a small data file with [tests/fixtures/make_fixture.csx](server/tests/fixtures/make_fixture.csx). CI builds UTMT 0.9.2.0 from source and runs all tests.

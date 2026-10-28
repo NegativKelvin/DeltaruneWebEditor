@@ -1,0 +1,57 @@
+{
+  "duration": 240,
+  "bullet_object": "obj_collidebullet",
+  "box": {
+    "frame": 0,
+    "x": 320,
+    "y": 170,
+    "w": 150,
+    "h": 150
+  },
+  "box_keys": [],
+  "box_code": false,
+  "soul": {
+    "speed": 4,
+    "slow": 2,
+    "radius": 4,
+    "graze": 24,
+    "iframes": 30,
+    "hp": 100
+  },
+  "emitters": [
+    {
+      "name": "ring",
+      "enabled": true,
+      "start": 10,
+      "end": 200,
+      "interval": 20,
+      "origin": "box",
+      "x": 0,
+      "y": -140,
+      "jitter_x": 0,
+      "jitter_y": 0,
+      "radius": 0,
+      "count": 8,
+      "angle": 270,
+      "spread": 90,
+      "spin": 7,
+      "aim": false,
+      "jitter_angle": 0,
+      "speed": 3,
+      "speed_step": 0,
+      "accel": 0,
+      "gravity": 0,
+      "gravity_dir": 270,
+      "turn": 0,
+      "life": 0,
+      "sprite": "",
+      "scale": 1,
+      "rotate": false,
+      "size": 6,
+      "color": "#ffffff",
+      "damage": 0,
+      "on_spawn": ""
+    }
+  ],
+  "notes": ""
+}
