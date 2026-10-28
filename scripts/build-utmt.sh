@@ -16,6 +16,8 @@ src=${3:-$(mktemp -d)/utmt-src}
 if [ ! -d "$src/.git" ]; then
   git clone --depth 1 --branch "$UTMT_TAG" --recurse-submodules --shallow-submodules "$UTMT_REPO" "$src"
 fi
+# Physical path: on macOS mktemp gives /var (a symlink to /private/var), and the mixed paths make MSBuild flatten content files.
+src=$(cd "$src" && pwd -P)
 got=$(git -C "$src" rev-parse HEAD)
 if [ "$got" != "$UTMT_COMMIT" ]; then
   echo "UTMT tag $UTMT_TAG is at $got, expected $UTMT_COMMIT" >&2
