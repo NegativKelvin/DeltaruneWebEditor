@@ -137,13 +137,21 @@ impl Utmt {
     }
 }
 
-/// Finds UndertaleModCli next to the server, in ./tools, or on PATH.
+/// Folder of the running server executable.
+pub fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Finds UndertaleModCli: the bundled copy (`tools/UndertaleModCli/` next to the server), then ./, ./tools/, `PATH`.
 pub fn locate_cli() -> Option<PathBuf> {
     let exe = if cfg!(windows) { "UndertaleModCli.exe" } else { "UndertaleModCli" };
-    let mut dirs: Vec<PathBuf> = vec![PathBuf::from("."), PathBuf::from("tools"), PathBuf::from("tools/UndertaleModCli")];
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = exe_dir() {
+        dirs.push(dir.join("tools/UndertaleModCli"));
+        dirs.push(dir.join("tools"));
         dirs.push(dir);
     }
+    dirs.extend([PathBuf::from("tools/UndertaleModCli"), PathBuf::from("tools"), PathBuf::from(".")]);
     if let Some(path) = std::env::var_os("PATH") {
         dirs.extend(std::env::split_paths(&path));
     }
