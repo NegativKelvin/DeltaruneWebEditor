@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 
 const MAX_LOG_LINES: usize = 2000;
+/// Finished jobs to keep. Older ones are removed when a new job starts.
+const MAX_FINISHED_JOBS: usize = 50;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +40,13 @@ impl Jobs {
         let mut jobs = self.jobs.lock().unwrap();
         if jobs.values().any(|j| j.chapter == chapter && j.status == JobStatus::Running) {
             return None;
+        }
+        let mut done: Vec<u64> = jobs.values().filter(|j| j.status != JobStatus::Running).map(|j| j.id).collect();
+        if done.len() > MAX_FINISHED_JOBS {
+            done.sort_unstable();
+            for id in &done[..done.len() - MAX_FINISHED_JOBS] {
+                jobs.remove(id);
+            }
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         jobs.insert(
@@ -111,5 +120,21 @@ mod tests {
         assert_eq!(job.status, JobStatus::Failed);
         assert_eq!(job.log, ["hello"]);
         assert!(jobs.start("build", "chapter1").is_some());
+    }
+
+    #[test]
+    fn keeps_recent_finished_jobs() {
+        let jobs = Jobs::default();
+        let first = jobs.start("build", "c").unwrap();
+        jobs.finish(first, Ok(()));
+        let mut last = first;
+        for _ in 0..MAX_FINISHED_JOBS + 5 {
+            last = jobs.start("build", "c").unwrap();
+            jobs.finish(last, Ok(()));
+        }
+        let running = jobs.start("build", "c").unwrap();
+        assert!(jobs.get(first).is_none());
+        assert!(jobs.get(last).is_some() && jobs.get(running).is_some());
+        assert_eq!(jobs.list().len(), MAX_FINISHED_JOBS + 1);
     }
 }
