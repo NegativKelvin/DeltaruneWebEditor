@@ -37,3 +37,5 @@ jobs:
           node-version: "22"
       - name: Check JavaScript syntax
         run: for f in $(find web/js -name '*.js'); do echo "$f"; node --input-type=module --check < "$f"; done
+      - name: Test JavaScript (battle simulator, room preview rules)
+        run: node --test web/tests/*.test.mjs

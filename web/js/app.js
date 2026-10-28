@@ -20,6 +20,8 @@ const views = {
   dialogue: () => import('./editors/dialogue.js'),
   cutscenes: () => import('./editors/cutscene.js'),
   enemies: () => import('./editors/enemy.js'),
+  preview: () => import('./views/preview.js'),
+  battle: () => import('./editors/battle.js'),
   data: () => import('./views/datalists.js'),
   search: () => import('./views/search.js'),
 };
@@ -106,6 +108,9 @@ function renderNav() {
     navLink(`${c}/sprites`, 'Sprites', state.counts.sprites),
     navLink(`${c}/enemies`, 'Enemies and encounters'),
     navLink(`${c}/shaders`, 'Shaders', state.counts.shaders),
+    h('div', { class: 'nav-head' }, 'Test'),
+    navLink(`${c}/preview`, 'Room preview'),
+    navLink(`${c}/battle`, 'Bullet patterns and battle box'),
     h('div', { class: 'nav-head' }, 'All assets'),
     Object.entries(ASSET_LABELS).map(([slug, label]) => navLink(`${c}/assets/${slug}`, label, state.counts[slug])),
     h('div', { class: 'nav-head' }, 'Tools'),

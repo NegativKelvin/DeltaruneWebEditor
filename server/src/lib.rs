@@ -8,5 +8,6 @@ pub mod enemies;
 pub mod error;
 pub mod gml;
 pub mod jobs;
+pub mod patterns;
 pub mod store;
 pub mod utmt;

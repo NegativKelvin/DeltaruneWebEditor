@@ -47,7 +47,7 @@ export async function render(main, ctx) {
 
   page.append(h('div', { class: 'row' }, h('h2', { class: 'grow' }, 'Enemies and encounters'), saveBtn),
     h('p', { class: 'dim small' }, 'Values are GML expressions. Enemy behaviour (attacks, ACTs, text) is in the enemy objects: open them from the encounter list. ',
-      'Bullet patterns and the battle box get their own editor in step 3.'));
+      'Bullet patterns and the battle box: see Test › Bullet patterns.'));
 
   // Enemy stats
   const extraFields = [...new Set(monsters.flatMap((m) => Object.keys(m.fields)))].filter((f) => !STAT_FIELDS.includes(f)).sort();
