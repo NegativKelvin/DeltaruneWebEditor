@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deltarune Web Editor</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0 auto; max-width: 720px; padding: 16px; }
+  pre { overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>Deltarune Web Editor</h1>
+<p>Backend is running. The editors come in step 2. Server state:</p>
+<pre id="out">Loading...</pre>
+<script>
+(async () => {
+  const get = async (p) => (await fetch(p)).json();
+  const [health, settings, chapters] = await Promise.all([get('/api/health'), get('/api/settings'), get('/api/chapters')]);
+  document.getElementById('out').textContent = JSON.stringify({ health, settings, chapters }, null, 2);
+})().catch((e) => { document.getElementById('out').textContent = String(e); });
+</script>
+</body>
+</html>
