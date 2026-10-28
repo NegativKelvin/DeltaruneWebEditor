@@ -46,7 +46,7 @@ Open <http://127.0.0.1:7878>. You can also set the paths later with `PUT /api/se
 | `--web` | `DRE_WEB_DIR` | `web` (in the current folder, else next to the server) |
 | `--listen` | `DRE_LISTEN` | `127.0.0.1:7878` |
 
-The server accepts only requests addressed to `localhost`/`127.0.0.1` (DNS-rebinding guard), and it sends no CORS headers.
+The server accepts only requests addressed to `localhost`/`127.0.0.1` (DNS-rebinding guard), and it sends no CORS headers. POST, PUT, and DELETE from a page of another origin (another site or port) get `403` (CSRF guard); requests without `Origin` (curl, scripts) are accepted.
 
 ## Editors (webpage)
 
