@@ -41,6 +41,19 @@ async fn call(app: &axum::Router, method: &str, uri: &str, body: Option<Value>) 
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+async fn call_raw(app: &axum::Router, uri: &str, body: Vec<u8>) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("host", "localhost")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
 async fn wait_job(app: &axum::Router, job: u64) -> Value {
     for _ in 0..300 {
         let (_, j) = call(app, "GET", &format!("/api/jobs/{job}"), None).await;
@@ -80,7 +93,7 @@ async fn extract_edit_build_roundtrip() {
         Settings {
             game_dir: Some(game),
             utmt_cli: Some(cli.clone()),
-            save_dir: None,
+            ..Default::default()
         },
     );
     let app = dre_server::api::router(state);
@@ -184,4 +197,93 @@ async fn extract_edit_build_roundtrip() {
         "{live_step}"
     );
     assert!(gml.contains("obj_dre_live"), "{gml}");
+
+    // Mod package: export, install it in the loader, apply it to the game, restore.
+    let key = "obj_talk_slash_Create_0_gml_2_0";
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/api/chapters/chapter1/lang/lang_ja.json",
+        Some(json!({ key: "* MOD JA" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, ex) = call(&app, "POST", "/api/export", Some(json!({ "id": "e2e_mod", "version": "1.0" }))).await;
+    assert_eq!(st, StatusCode::OK, "{ex:#}");
+    assert_eq!(ex["file"], "e2e_mod-1.0.dremod");
+    let pkg = std::fs::read(tmp.path().join("ws/exports/e2e_mod-1.0.dremod")).unwrap();
+    let original = std::fs::read(ch1.join("data.win")).unwrap();
+    let (st, m) = call_raw(&app, "/api/loader/mods", pkg).await;
+    assert_eq!(st, StatusCode::OK, "{m:#}");
+    let (_, check) = call(&app, "GET", "/api/loader/mods/e2e_mod/check", None).await;
+    assert_eq!(check[0]["same_version"], true, "{check:#}");
+    let (st, j) = call(&app, "POST", "/api/loader/apply", None).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let job = wait_job(&app, j["job"].as_u64().unwrap()).await;
+    assert_eq!(job["status"], "succeeded", "{job:#}");
+
+    let check = tmp.path().join("check_game");
+    run_cli(
+        &cli,
+        tmp.path(),
+        &["load", ch1.join("data.win").to_str().unwrap(), "-s", script.to_str().unwrap()],
+        &[("DRE_PROJECT_DIR", &check.join("p")), ("DRE_GENERIC_DIR", &check.join("g"))],
+    );
+    let gml = std::fs::read_to_string(check.join("p/code/gml_Object_obj_talk_Create_0.gml")).unwrap();
+    assert!(gml.contains("* Modded./%"), "{gml}");
+    assert!(std::fs::read_to_string(ch1.join("lang/lang_ja.json")).unwrap().contains("* MOD JA"));
+    // The editor keeps using the original data file (the loader backup).
+    let (_, chapters) = call(&app, "GET", "/api/chapters", None).await;
+    assert_eq!(chapters[0]["game_changed"], false, "{chapters:#}");
+    let (_, status) = call(&app, "GET", "/api/loader", None).await;
+    assert_eq!(status["chapters"][0]["state"], "modded", "{status:#}");
+    assert_eq!(status["chapters"][0]["pending"], false);
+
+    let (st, r) = call(&app, "POST", "/api/loader/restore", None).await;
+    assert_eq!(st, StatusCode::OK, "{r:#}");
+    assert_eq!(std::fs::read(ch1.join("data.win")).unwrap(), original);
+    assert!(std::fs::read_to_string(ch1.join("lang/lang_ja.json")).unwrap().contains("ねえ"));
+
+    // xdelta: export a patch of the built chapter, install it like a player, apply it.
+    let (st, x) = call(&app, "POST", "/api/chapters/chapter1/export-xdelta", Some(json!({ "id": "e2e" }))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{x:#}");
+    let job = wait_job(&app, x["job"].as_u64().unwrap()).await;
+    assert_eq!(job["status"], "succeeded", "{job:#}");
+    let patch_path = tmp.path().join("ws/exports/e2e-chapter1.xdelta");
+    let built = std::fs::read(tmp.path().join("ws/chapter1/build/data.win")).unwrap();
+    if std::process::Command::new("xdelta3").arg("-V").output().is_ok() {
+        let out = tmp.path().join("xdelta3-out.win");
+        let st = std::process::Command::new("xdelta3")
+            .args(["-d", "-f", "-s"])
+            .arg(ch1.join("data.win"))
+            .arg(&patch_path)
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert_eq!(std::fs::read(&out).unwrap(), built, "xdelta3 output");
+    }
+    let (st, m) = call_raw(
+        &app,
+        "/api/loader/mods?name=e2e-chapter1.xdelta",
+        std::fs::read(&patch_path).unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m:#}");
+    assert_eq!(m["chapters"]["chapter1"]["xdelta"], "patch.xdelta");
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/api/loader/mods",
+        Some(json!([{ "id": "e2e_mod", "enabled": false }, { "id": "e2e-chapter1", "enabled": true }])),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, j) = call(&app, "POST", "/api/loader/apply", None).await;
+    let job = wait_job(&app, j["job"].as_u64().unwrap()).await;
+    assert_eq!(job["status"], "succeeded", "{job:#}");
+    assert_eq!(std::fs::read(ch1.join("data.win")).unwrap(), built);
+    let (st, _) = call(&app, "POST", "/api/loader/restore", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(std::fs::read(ch1.join("data.win")).unwrap(), original);
 }

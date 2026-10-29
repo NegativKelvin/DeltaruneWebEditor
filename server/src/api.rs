@@ -23,12 +23,19 @@ use crate::enemies;
 use crate::error::{Error, Result};
 use crate::flags;
 use crate::gml;
-use crate::jobs::Jobs;
+use crate::jobs::{JobStatus, Jobs};
+use crate::langmod;
 use crate::live;
+use crate::loader::{self, Loader, ModEntry};
+use crate::modpkg::{self, ExportChapter, ExportRequest};
 use crate::patterns::{self, Pattern, PatternStore};
 use crate::saves::{self, Saves};
 use crate::store::{self, ASSET_TYPES, ChapterStore};
 use crate::utmt::Utmt;
+use crate::versions;
+
+/// Job "chapter" of the mod loader (one apply at a time).
+const GAME_JOB: &str = "game";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
@@ -36,8 +43,8 @@ pub struct Settings {
     pub game_dir: Option<PathBuf>,
     /// Path to the UndertaleModCli executable.
     pub utmt_cli: Option<PathBuf>,
-    /// Game save folder (holds `filech1_0`, ...). Found automatically when not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deltarune save folder (for save backups). Found automatically if not set.
+    #[serde(default)]
     pub save_dir: Option<PathBuf>,
 }
 
@@ -45,6 +52,7 @@ pub struct AppState {
     pub workspace: PathBuf,
     pub settings: RwLock<Settings>,
     pub jobs: Jobs,
+    pub loader: Loader,
     dialogue_cache: Mutex<HashMap<String, Arc<Vec<DialogueLine>>>>,
     cutscene_cache: Mutex<HashMap<String, Arc<CutsceneList>>>,
     enemy_cache: Mutex<HashMap<String, Arc<Vec<enemies::Record>>>>,
@@ -81,6 +89,7 @@ type St = State<Arc<AppState>>;
 impl AppState {
     pub fn new(workspace: PathBuf, settings: Settings) -> Arc<Self> {
         Arc::new(Self {
+            loader: Loader::new(&workspace),
             workspace,
             settings: RwLock::new(settings),
             jobs: Jobs::default(),
@@ -131,6 +140,30 @@ impl AppState {
         Ok((ch, store))
     }
 
+    /// Chapter with its original data file: the loader backup while the game file holds installed mods.
+    fn source_chapter(&self, id: &str) -> Result<(Chapter, ChapterStore)> {
+        let (mut ch, store) = self.chapter(id)?;
+        ch.data_file = self.loader.original_data_file(&ch);
+        Ok((ch, store))
+    }
+
+    fn save_dir(&self) -> Option<PathBuf> {
+        self.settings.read().unwrap().save_dir.clone().or_else(loader::default_save_dir)
+    }
+
+    /// Mod loader changes wait while an apply runs.
+    fn loader_idle(&self) -> Result<()> {
+        if self
+            .jobs
+            .list()
+            .iter()
+            .any(|j| j.chapter == GAME_JOB && j.status == JobStatus::Running)
+        {
+            return Err(Error::Conflict("the mod loader is applying mods; wait for the job to end".into()));
+        }
+        Ok(())
+    }
+
     /// Store for an extracted chapter.
     fn extracted(&self, id: &str) -> Result<ChapterStore> {
         let (_, store) = self.chapter(id)?;
@@ -161,21 +194,19 @@ impl AppState {
         self.flag_cache.lock().unwrap().remove(chapter);
     }
 
-    /// Game save folder: the setting, else the usual place for the platform.
-    fn save_dir(&self) -> Result<PathBuf> {
-        let s = self.settings.read().unwrap();
-        s.save_dir
-            .clone()
-            .or_else(|| saves::default_dir(s.game_dir.as_deref()))
-            .ok_or_else(|| Error::Conflict("save_dir is not set and the Deltarune save folder was not found".into()))
+    /// Save folder for the save editor and hot reload: `save_dir()`, else the Proton prefix of the game's Steam library.
+    fn save_folder(&self) -> Result<PathBuf> {
+        self.save_dir()
+            .or_else(|| saves::default_dir(self.settings.read().unwrap().game_dir.as_deref()))
+            .ok_or_else(|| Error::Conflict("no save folder found; set save_dir in Setup".into()))
     }
 
     fn saves(&self) -> Result<Saves> {
-        Ok(Saves::new(self.save_dir()?, &self.workspace))
+        Ok(Saves::new(self.save_folder()?, &self.workspace))
     }
 
     fn live_dir(&self) -> Result<PathBuf> {
-        Ok(self.save_dir()?.join(live::DIR))
+        Ok(self.save_folder()?.join(live::DIR))
     }
 
     fn flag_refs(&self, chapter: &str, store: &ChapterStore) -> Arc<Vec<flags::Ref>> {
@@ -259,7 +290,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chapters/{ch}/flags/refs", get(flag_refs))
         .route("/api/chapters/{ch}/flag-notes", get(get_flag_notes).put(put_flag_notes))
         .route("/api/chapters/{ch}/save-layout", get(save_layout))
-        .route("/api/saves", get(list_saves))
+        .route("/api/saves", get(list_save_files))
         .route("/api/saves/{file}", get(read_save).put(write_save))
         .route("/api/saves/{file}/copy", post(copy_save))
         .route("/api/saves/{file}/load", post(load_save))
@@ -274,6 +305,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/chapters/{ch}/mods", get(list_mods))
         .route("/api/chapters/{ch}/conflicts", post(check_conflicts))
+        .route("/api/chapters/{ch}/version-check", get(version_check))
+        .route("/api/chapters/{ch}/version-check/accept", post(version_accept))
+        .route("/api/chapters/{ch}/lang", get(lang_index))
+        .route("/api/chapters/{ch}/lang/{file}", get(get_lang).put(put_lang).delete(delete_lang))
+        .route("/api/export", post(export_mod))
+        .route("/api/chapters/{ch}/export-xdelta", post(export_xdelta))
+        .route("/api/exports", get(list_exports))
+        .route("/api/exports/{file}", get(get_export))
+        .route("/api/loader", get(loader_status))
+        .route("/api/loader/mods", post(install_mod).put(set_mods))
+        .route("/api/loader/mods/{id}", axum::routing::delete(uninstall_mod))
+        .route("/api/loader/mods/{id}/check", get(check_mod))
+        .route("/api/loader/apply", post(apply_mods))
+        .route("/api/loader/restore", post(restore_game))
+        .route("/api/loader/saves", get(list_saves).post(backup_saves))
+        .route("/api/loader/saves/{name}", axum::routing::delete(delete_saves))
+        .route("/api/loader/saves/{name}/restore", post(restore_saves))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
@@ -281,7 +329,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 async fn get_settings(State(s): St) -> Json<Value> {
     let mut v = json!(s.settings.read().unwrap().clone());
     // The folder that is used when save_dir is not set.
-    v["save_dir_found"] = json!(s.save_dir().ok());
+    v["save_dir_found"] = json!(s.save_folder().ok());
     Json(v)
 }
 
@@ -344,9 +392,28 @@ async fn cancel_job(State(s): St, Path(id): Path<u64>) -> Result<StatusCode> {
     }
 }
 
+/// The original data file differs from the one the chapter was extracted from (game update).
+fn game_changed(meta: &Value, original: &std::path::Path) -> bool {
+    let Ok(m) = std::fs::metadata(original) else { return false };
+    if meta["data_file_size"].as_u64().is_some_and(|n| n != m.len()) {
+        return true;
+    }
+    let Some(sha) = meta["data_file_sha256"].as_str() else {
+        return false;
+    };
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let same_file = meta["data_file"].as_str() == original.to_str() && meta["data_file_modified"].as_u64() == mtime;
+    !same_file && crate::hash::file_sha256(original).is_ok_and(|h| h != sha)
+}
+
 async fn list_chapters(State(s): St) -> Result<Json<Vec<Value>>> {
     let ws = s.workspace.clone();
     let chapters = s.chapters()?;
+    let st = s.clone();
     blocking(move || {
         Ok(chapters
             .into_iter()
@@ -355,7 +422,8 @@ async fn list_chapters(State(s): St) -> Result<Json<Vec<Value>>> {
                 let meta: Option<Value> = std::fs::read(store.root.join("meta.json"))
                     .ok()
                     .and_then(|b| serde_json::from_slice(&b).ok());
-                json!({ "id": c.id, "number": c.number, "data_file": c.data_file, "extracted": store.is_extracted(), "meta": meta })
+                let changed = meta.as_ref().is_some_and(|m| game_changed(m, &st.loader.original_data_file(&c)));
+                json!({ "id": c.id, "number": c.number, "data_file": c.data_file, "extracted": store.is_extracted(), "meta": meta, "game_changed": changed })
             })
             .collect())
     })
@@ -364,7 +432,7 @@ async fn list_chapters(State(s): St) -> Result<Json<Vec<Value>>> {
 }
 
 async fn extract(State(s): St, Path(ch): Path<String>) -> Result<impl IntoResponse> {
-    let (chapter, store) = s.chapter(&ch)?;
+    let (chapter, store) = s.source_chapter(&ch)?;
     let utmt = s.utmt()?;
     let job = s
         .jobs
@@ -381,7 +449,7 @@ async fn extract(State(s): St, Path(ch): Path<String>) -> Result<impl IntoRespon
 
 async fn build(State(s): St, Path(ch): Path<String>) -> Result<impl IntoResponse> {
     let store = s.extracted(&ch)?;
-    let (chapter, _) = s.chapter(&ch)?;
+    let (chapter, _) = s.source_chapter(&ch)?;
     let utmt = s.utmt()?;
     let job = s
         .jobs
@@ -839,7 +907,7 @@ async fn save_layout(State(s): St, Path(ch): Path<String>) -> Result<Json<flags:
     .await
 }
 
-async fn list_saves(State(s): St) -> Result<Json<Value>> {
+async fn list_save_files(State(s): St) -> Result<Json<Value>> {
     let saves = s.saves()?;
     Ok(Json(json!({ "dir": saves.dir, "files": saves.list()?, "copies": saves.copies() })))
 }
@@ -1045,6 +1113,291 @@ async fn check_conflicts(State(s): St, Path(ch): Path<String>, body: Bytes) -> R
         })))
     })
     .await
+}
+
+async fn version_check(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let store = s.extracted(&ch)?;
+    blocking(move || Ok(Json(json!({ "items": versions::report(&store)? })))).await
+}
+
+#[derive(Deserialize)]
+struct AssetKey {
+    #[serde(rename = "type")]
+    ty: String,
+    name: String,
+}
+
+async fn version_accept(State(s): St, Path(ch): Path<String>, Json(k): Json<AssetKey>) -> Result<StatusCode> {
+    let store = s.extracted(&ch)?;
+    let st = s.clone();
+    blocking(move || {
+        let _w = st.write_lock();
+        versions::accept(&store, &k.ty, &k.name)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn lang_index(State(s): St, Path(ch): Path<String>) -> Result<Json<Value>> {
+    let (chapter, store) = s.chapter(&ch)?;
+    Ok(Json(
+        json!({ "files": langmod::game_files(&chapter.dir), "changed": langmod::list(&store) }),
+    ))
+}
+
+async fn get_lang(State(s): St, Path((ch, file)): Path<(String, String)>) -> Result<Json<Value>> {
+    let (_, store) = s.chapter(&ch)?;
+    Ok(Json(Value::Object(langmod::read(&store, &file)?)))
+}
+
+async fn put_lang(
+    State(s): St,
+    Path((ch, file)): Path<(String, String)>,
+    Json(changes): Json<serde_json::Map<String, Value>>,
+) -> Result<Json<Value>> {
+    let (_, store) = s.chapter(&ch)?;
+    let _w = s.write_lock();
+    Ok(Json(Value::Object(langmod::merge(&store, &file, changes)?)))
+}
+
+async fn delete_lang(State(s): St, Path((ch, file)): Path<(String, String)>) -> Result<StatusCode> {
+    let (_, store) = s.chapter(&ch)?;
+    let _w = s.write_lock();
+    langmod::clear(&store, &file)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn exports_dir(s: &AppState) -> PathBuf {
+    s.workspace.join("exports")
+}
+
+async fn export_mod(State(s): St, Json(req): Json<ExportRequest>) -> Result<Json<Value>> {
+    let mut chapters = Vec::new();
+    for c in s.chapters()? {
+        if req.chapters.as_ref().is_some_and(|l| !l.contains(&c.id)) {
+            continue;
+        }
+        let store = ChapterStore::new(&s.workspace, &c.id);
+        if store.is_extracted() {
+            chapters.push(ExportChapter {
+                data_file: s.loader.original_data_file(&c),
+                id: c.id,
+                store,
+            });
+        }
+    }
+    for id in req.chapters.iter().flatten() {
+        if !chapters.iter().any(|c| &c.id == id) {
+            return Err(Error::BadRequest(format!("chapter '{id}' is not extracted")));
+        }
+    }
+    let st = s.clone();
+    blocking(move || {
+        let _w = st.write_lock();
+        let (path, manifest) = modpkg::export(&exports_dir(&st), &req, &chapters)?;
+        Ok(Json(json!({
+            "file": path.file_name().and_then(|f| f.to_str()),
+            "size": std::fs::metadata(&path)?.len(),
+            "manifest": manifest,
+        })))
+    })
+    .await
+}
+
+async fn list_exports(State(s): St) -> Json<Value> {
+    let mut v: Vec<Value> = std::fs::read_dir(exports_dir(&s))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let file = e
+                .file_name()
+                .into_string()
+                .ok()
+                .filter(|f| f.ends_with(".dremod") || f.ends_with(".xdelta"))?;
+            let m = e.metadata().ok()?;
+            let modified = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            Some(json!({ "file": file, "size": m.len(), "modified": modified }))
+        })
+        .collect();
+    v.sort_by(|a, b| b["modified"].as_u64().cmp(&a["modified"].as_u64()));
+    Json(json!(v))
+}
+
+async fn get_export(State(s): St, Path(file): Path<String>) -> Result<impl IntoResponse> {
+    store::validate_name(&file)?;
+    let ct = if file.ends_with(".dremod") {
+        "application/zip"
+    } else if file.ends_with(".xdelta") {
+        "application/octet-stream"
+    } else {
+        return Err(Error::NotFound(file));
+    };
+    let bytes = tokio::fs::read(exports_dir(&s).join(&file)).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, ct.to_owned()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\"")),
+        ],
+        bytes,
+    ))
+}
+
+#[derive(Deserialize)]
+struct XdeltaExport {
+    id: Option<String>,
+}
+
+/// Builds the chapter, then writes `exports/<id>-<chapter>.xdelta`: the patch from the original data file.
+async fn export_xdelta(State(s): St, Path(ch): Path<String>, body: Bytes) -> Result<impl IntoResponse> {
+    let req: XdeltaExport = if body.iter().all(u8::is_ascii_whitespace) {
+        XdeltaExport { id: None }
+    } else {
+        serde_json::from_slice(&body)?
+    };
+    let id = req.id.filter(|i| !i.is_empty()).unwrap_or_else(|| "mod".into());
+    store::validate_name(&id)?;
+    let store = s.extracted(&ch)?;
+    let (chapter, _) = s.source_chapter(&ch)?;
+    let utmt = s.utmt()?;
+    let file = format!("{id}-{ch}.xdelta");
+    let job = s
+        .jobs
+        .start("export xdelta", &ch)
+        .ok_or_else(|| Error::Conflict(format!("a job already runs for '{ch}'")))?;
+    let st = s.clone();
+    let f = file.clone();
+    tokio::spawn(async move {
+        let r = async {
+            let built = utmt.build(&st.jobs, job, &chapter, &store).await?;
+            let out = exports_dir(&st).join(&f);
+            let original = chapter.data_file.clone();
+            st.jobs.log(job, format!("xdelta: {} -> {}", original.display(), built.display()));
+            let o = out.clone();
+            blocking(move || {
+                std::fs::create_dir_all(o.parent().unwrap())?;
+                crate::xdelta::encode(&original, &built, &o)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            st.jobs.log(job, format!("xdelta: wrote {} ({size} bytes)", out.display()));
+            Ok::<(), String>(())
+        }
+        .await;
+        st.jobs.finish(job, r);
+    });
+    Ok((StatusCode::ACCEPTED, Json(json!({ "job": job, "file": file }))))
+}
+
+async fn loader_status(State(s): St) -> Result<Json<Value>> {
+    let chapters = s.chapters()?;
+    let st = s.clone();
+    blocking(move || {
+        let mut v = st.loader.status(&chapters)?;
+        v["save_dir"] = json!(st.save_dir());
+        v["utmt_cli"] = json!(st.settings.read().unwrap().utmt_cli.is_some());
+        Ok(Json(v))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct InstallQuery {
+    /// File name (an xdelta patch gets its mod id from it).
+    name: Option<String>,
+    /// Chapter of an xdelta patch. Default: the chapter that the patch fits.
+    chapter: Option<String>,
+}
+
+/// Body: a `.dremod` package or an `.xdelta` patch.
+async fn install_mod(State(s): St, Query(q): Query<InstallQuery>, body: Bytes) -> Result<Json<Value>> {
+    s.loader_idle()?;
+    let xdelta = crate::xdelta::is_vcdiff(&body);
+    let chapters = if xdelta { s.chapters()? } else { Vec::new() };
+    let st = s.clone();
+    blocking(move || {
+        std::fs::create_dir_all(&st.loader.root)?;
+        let tmp = st.loader.root.join(format!("upload-{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &body)?;
+        let r = if xdelta {
+            let name = q.name.as_deref().unwrap_or("xdelta_mod");
+            st.loader.install_xdelta(&tmp, name, q.chapter.as_deref(), &chapters)
+        } else {
+            st.loader.install(&tmp)
+        };
+        let _ = std::fs::remove_file(&tmp);
+        Ok(Json(json!(r?)))
+    })
+    .await
+}
+
+async fn set_mods(State(s): St, Json(mods): Json<Vec<ModEntry>>) -> Result<StatusCode> {
+    s.loader_idle()?;
+    s.loader.set_mods(mods)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn uninstall_mod(State(s): St, Path(id): Path<String>) -> Result<StatusCode> {
+    s.loader_idle()?;
+    let st = s.clone();
+    blocking(move || st.loader.uninstall(&id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn check_mod(State(s): St, Path(id): Path<String>) -> Result<Json<Value>> {
+    let chapters = s.chapters()?;
+    let st = s.clone();
+    blocking(move || Ok(Json(json!(st.loader.check(&st.workspace, &id, &chapters)?)))).await
+}
+
+async fn apply_mods(State(s): St) -> Result<impl IntoResponse> {
+    let chapters = s.chapters()?;
+    let utmt = s.utmt().ok();
+    let save_dir = s.save_dir();
+    let job = s
+        .jobs
+        .start("apply mods", GAME_JOB)
+        .ok_or_else(|| Error::Conflict("the mod loader is applying mods; wait for the job to end".into()))?;
+    let st = s.clone();
+    tokio::spawn(async move {
+        let r = st.loader.apply(&st.jobs, job, utmt, chapters, save_dir).await;
+        st.jobs.finish(job, r.map_err(|e| e.to_string()));
+    });
+    Ok((StatusCode::ACCEPTED, Json(json!({ "job": job }))))
+}
+
+async fn restore_game(State(s): St) -> Result<Json<Value>> {
+    s.loader_idle()?;
+    let chapters = s.chapters()?;
+    let st = s.clone();
+    blocking(move || Ok(Json(json!({ "restored": st.loader.restore(&chapters)? })))).await
+}
+
+fn need_save_dir(s: &AppState) -> Result<PathBuf> {
+    s.save_dir()
+        .ok_or_else(|| Error::Conflict("no save folder found; set save_dir in Setup".into()))
+}
+
+async fn list_saves(State(s): St) -> Json<Value> {
+    Json(json!({ "save_dir": s.save_dir(), "backups": s.loader.save_backups() }))
+}
+
+async fn backup_saves(State(s): St) -> Result<Json<Value>> {
+    let dir = need_save_dir(&s)?;
+    let st = s.clone();
+    blocking(move || Ok(Json(json!(st.loader.backup_saves(&dir, "manual")?)))).await
+}
+
+async fn restore_saves(State(s): St, Path(name): Path<String>) -> Result<Json<Value>> {
+    let dir = need_save_dir(&s)?;
+    let st = s.clone();
+    blocking(move || Ok(Json(json!({ "before_restore": st.loader.restore_saves(&dir, &name)? })))).await
+}
+
+async fn delete_saves(State(s): St, Path(name): Path<String>) -> Result<StatusCode> {
+    s.loader.delete_save_backup(&name)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

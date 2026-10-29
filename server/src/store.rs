@@ -148,6 +148,33 @@ impl ChapterStore {
     pub fn is_extracted(&self) -> bool {
         self.base().join("project.json").is_file()
     }
+    /// Translation changes: `lang/<file>.json` with only the changed keys.
+    pub fn lang_dir(&self) -> PathBuf {
+        self.root.join("lang")
+    }
+
+    /// Hash of an asset (JSON and side files) in `base/` (`from_mod` false) or `mod/`. `None` if it is not there.
+    pub fn asset_hash(&self, ty: &AssetType, name: &str, from_mod: bool) -> Result<Option<String>> {
+        validate_name(name)?;
+        let root = if from_mod { self.mod_dir() } else { self.base() };
+        let json = root.join(Self::rel_json(ty, name));
+        if !Self::exists(&json, ty) {
+            return Ok(None);
+        }
+        let files: Vec<PathBuf> = Self::side_files(&json, ty, name)
+            .into_iter()
+            .chain(json.is_file().then(|| json.clone()))
+            .collect();
+        Ok(Some(crate::hash::files_sha256(&files)?))
+    }
+
+    /// Every asset in `mod/` (changed or new).
+    pub fn changed_assets(&self) -> Vec<(&'static AssetType, AssetEntry)> {
+        ASSET_TYPES
+            .iter()
+            .flat_map(|t| self.list(t).into_iter().filter(|e| e.modified).map(move |e| (t, e)))
+            .collect()
+    }
 
     /// The asset exists at this JSON path. Code may have only `<name>.gml` (UTMT omits default JSON).
     fn exists(json: &Path, ty: &AssetType) -> bool {
@@ -273,6 +300,8 @@ impl ChapterStore {
             return Ok(dst);
         }
         let src = self.base().join(&rel);
+        // Keep the hash of the game version that this change starts from (version check after a game update).
+        crate::versions::set_base(self, ty, name, self.asset_hash(ty, name, false)?)?;
         std::fs::create_dir_all(dst.parent().unwrap())?;
         if Self::exists(&src, ty) {
             for f in Self::side_files(&src, ty, name)

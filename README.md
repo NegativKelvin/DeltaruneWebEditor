@@ -4,7 +4,7 @@ A modding tool for Deltarune that runs in a webpage. A local Rust server (`serve
 [UndertaleModTool](https://github.com/UnderminersTeam/UndertaleModTool) CLI to decompile each chapter,
 serves every asset to the webpage (`web/`), stores edits, and builds a patched `data.win`.
 
-Status: step 1 (backend), step 2 (editors), step 3 (room preview, bullet patterns, battle box), and the game state tools (flags, save files, hot reload, mod conflicts) are done. Build and one-click test launch come later.
+Status: step 1 (backend), step 2 (editors), step 3 (room preview, bullet patterns, battle box), and step 4 (mod packages, mod loader, backups, version check) are done. One-click test launch comes later.
 
 ## Download and run (no other downloads)
 
@@ -45,6 +45,7 @@ Open <http://127.0.0.1:7878>. You can also set the paths later with `PUT /api/se
 | `--workspace` | `DRE_WORKSPACE` | `workspace` |
 | `--web` | `DRE_WEB_DIR` | `web` (in the current folder, else next to the server) |
 | `--listen` | `DRE_LISTEN` | `127.0.0.1:7878` |
+| (Setup page) | | `save_dir`: Deltarune save folder. Default: `%LOCALAPPDATA%/DELTARUNE` (Windows), `~/Library/Application Support/com.tobyfox.deltarune` (macOS), `~/.config/DELTARUNE` or the Steam Proton folder of app 1671210 (Linux) |
 
 The server accepts only requests addressed to `localhost`/`127.0.0.1` (DNS-rebinding guard), and it sends no CORS headers. POST, PUT, and DELETE from a page of another origin (another site or port) get `403` (CSRF guard); requests without `Origin` (curl, scripts) are accepted.
 
@@ -89,7 +90,7 @@ Sprite: B pencil, E eraser, G fill, I colour picker, O origin, arrows change fra
 
 Known limits:
 - Windows Deltarune draws shaders with the compiled HLSL11 data. After you change GLSL ES, compile HLSL 11 (`fxc`, `vs_4_0` / `ps_4_0`) and replace `HLSL11_*.bin` in the shader editor.
-- Translations in `lang/*.json` are read-only here (they are not in `data.win`). Step 4 (deploy) copies changed language files.
+- Translations in `lang/*.json` are not in `data.win`. Change them by key in Export mod; the loader writes them into a copy of the original file.
 - The enemy and cutscene views read decompiled GML. Values that the decompiler writes as numbers (for example an object index) show as numbers.
 
 ## Game state and live tools
@@ -101,7 +102,7 @@ Known limits:
 | Hot reload | Install a small persistent object `obj_dre_live` in the mod (one line in a host code entry, default `obj_time` Step, makes it). After one build, the running game reads `dre_live/cmd.txt` in the save folder 3 times per second. From the page: go to a room, restart the room, set a flag, set a global, set a variable on all instances of an object, replace a sprite with its saved frames, read all flags. The game writes `dre_live/ack.txt` (room, plot) once per second; the page shows "game connected". |
 | Mod conflicts | Compares two or more mods (UTMT project folders: this chapter's `mod/`, folders in `workspace/<chapter>/mods/`, and paths you give) with the original. Code: line diff; changes on different lines can go together ("different parts"), on the same or next lines they conflict. Other assets: by top-level field and by side file (sprite frames, sounds). |
 
-Save folder: set it in Setup, or the server finds it: `%LOCALAPPDATA%\DELTARUNE` (Windows), the Proton prefix `steamapps/compatdata/1671210/.../AppData/Local/DELTARUNE` (Linux), `~/Library/Application Support/com.tobyfox.deltarune` (macOS).
+Save folder: the `save_dir` setting (Setup), else the folder that the mod loader finds (`%LOCALAPPDATA%\DELTARUNE`, Proton, macOS Application Support), else the Proton prefix next to the game's Steam library.
 
 Known limits of the game state tools:
 - Hot reload changes data only. GameMaker has no way to load new code while the game runs, so changes to code, objects, rooms (layout, instances, creation code), dialogue text, sounds, and shaders need a build and a game restart.
@@ -109,6 +110,42 @@ Known limits of the game state tools:
 - Hot reload values are numbers or plain text, not GML expressions. Commands that the game did not acknowledge go again with the next batch, so a command can run twice.
 - Save labels come from the save script without running it. Conditions in the script (`if`) and loops whose bounds are not numbers are marked with a warning, and the page says when the line counts do not match. The room line holds what the game writes there (for example a room id), not a room name.
 - The flag browser finds `global.<name>` text in decompiled GML. Access through other names (`variable_global_get`, `with (global)`) is not found.
+## Share and install mods
+
+| Page | What you can do |
+|---|---|
+| Export mod | Make `workspace/exports/<id>-<version>.dremod` from the changes of the selected chapters. **Export .xdelta**: builds one chapter, then writes `workspace/exports/<id>-<chapter>.xdelta`. Download links. Translation changes: set new text for keys of `lang/lang_*.json` (only these keys change). |
+| Mods and backups | **Install mod and apply** (one click for players): a `.dremod` package or an `.xdelta` patch. Install only, enable or disable, load order (a later mod wins per asset and per text key), uninstall, **Check** (version check of a mod), **Apply** to the game, **Restore original game files**. Save backups: back up now, restore, delete. |
+| Chapter overview | Note when the game data file changed since the extract. Version check list: changes that started from another game version, with Keep (mark as checked) and Revert. |
+
+`.dremod` is a zip file: `dremod.json` (manifest), and per chapter the UTMT project of the changes (`<chapter>/project.json`, `<chapter>/<type>/...`) and `<chapter>/lang/<file>.json` (changed keys only).
+It never holds `data.win` or a full game file. Install builds the mods with UndertaleModCli on the player's own original data file, so a package also works on a newer game version while its assets still exist.
+
+Apply (in this order):
+1. Backs up the save folder to `workspace/loader/saves/<time>-auto/` (newest 20 automatic backups are kept).
+2. Backs up the original data file and lang files of each chapter to `workspace/loader/backup/<chapter>/`. A game file that is not the one the loader wrote (game update, Steam file check) becomes the new backup.
+3. Merges the enabled mods per chapter (load order), runs `project build` on the backup, and puts the output in the game folder (written to a temporary file first, then renamed).
+4. Lang files: the original with the changed keys of each mod. A chapter without enabled mods gets its original files back.
+
+### xdelta patches
+
+`.xdelta` (VCDIFF, RFC 3284) is the usual format of Deltarune mods. The server reads and writes it in Rust (no xdelta3 program needed):
+- Export writes plain VCDIFF with Adler-32 checksums, so xdelta3, Delta Patcher, and xdelta UI apply it. It holds only the difference to the original `data.win`, and only for that exact game version. Lang files are not in it (use `.dremod` for them).
+- Install reads patches from xdelta3 with no secondary compression and with LZMA (the xdelta3 default). DJW and FGK (`xdelta3 -S djw|fgk`) are not supported: the install gives an error.
+- Install finds the chapter by the patch checksums, or you give it (`?chapter=`). The patch must fit the original data file; for another game version, install and apply refuse it.
+- Apply: the xdelta patch goes on the original data file first; asset changes of `.dremod` mods are then built on its output. Two xdelta patches for one chapter: only the last one in load order is used (the log says so).
+
+While mods are in the game, the editor extracts and builds from the backup, so your workspace always starts from the original game.
+
+Version-safe changes: each changed asset keeps the hash of the game asset that it started from (`workspace/<chapter>/mod-base.json`, and `base` in the package manifest).
+After a game update and a new extract (or when a player's game differs), the check gives for each asset: `same`, `changed` (the game changed it too; the mod version replaces the game version), `removed` (not in the game now), `name_taken` (a new asset of the mod has a name that the game now uses), `new`, or `unknown`.
+For a player: the same game version needs no extract; for another version, extract the chapter to check each asset.
+
+Known limits of step 4:
+- Install needs UndertaleModCli (in the release package) for mods that change assets. Mods with only translation changes do not.
+- Two mods that change the same asset do not merge: the later one wins (the apply log names each case). Use Mod conflicts (Game state) to find them first.
+- Hashes come from the UTMT export. A different UTMT version can show `changed` for an asset that the game did not change.
+- Close the game before Apply or Restore: Windows does not let the loader replace a file that is in use.
 
 ## How data flows
 
@@ -132,7 +169,7 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | GET | `/api/health` | version |
 | GET/PUT | `/api/settings` | `{game_dir, utmt_cli, save_dir}`. `utmt_cli` must be outside the workspace. GET also gives `save_dir_found` (the folder in use) |
 | GET | `/api/asset-types` | the 12 editable types: slug, `$type`, own-directory flag |
-| GET | `/api/chapters` | chapters found in `game_dir`: `launcher`, `chapter1`, ... with `extracted` and `meta` |
+| GET | `/api/chapters` | chapters found in `game_dir`: `launcher`, `chapter1`, ... with `extracted`, `meta`, and `game_changed` (the original data file differs from the extracted one) |
 | POST | `/api/chapters/{ch}/extract` | `202 {job}` |
 | POST | `/api/chapters/{ch}/build` | `202 {job}` |
 | GET | `/api/jobs`, `/api/jobs/{id}` | status `running`/`succeeded`/`failed`, error, log lines |
@@ -173,6 +210,23 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | GET | `/api/live/flags` | `{values, age_ms}` from the last `dumpflags` |
 | GET | `/api/chapters/{ch}/mods` | mods in `workspace/{ch}/mods/` |
 | POST | `/api/chapters/{ch}/conflicts` | body `{paths?, own?}`: `{mods, findings:[{type, name, mods, kind, details}]}`. `kind`: `conflict`, `merge`, `same` |
+| GET | `/api/chapters/{ch}/version-check` | `{items:[{type, name, status}]}` for every changed asset (see Share and install mods) |
+| POST | `/api/chapters/{ch}/version-check/accept` | body `{type, name}`: mark a change as checked against the current game version |
+| GET | `/api/chapters/{ch}/lang` | `{files: [lang files of the game], changed: {file: key count}}` |
+| GET/PUT/DELETE | `/api/chapters/{ch}/lang/{file}` | translation changes of one file. PUT body `{key: "text" or null}` (null removes the change); DELETE removes all |
+| POST | `/api/chapters/{ch}/export-xdelta` | body `{id?}`: `202 {job, file}`. Builds the chapter, then writes `workspace/exports/<id>-<ch>.xdelta` |
+| POST | `/api/export` | body `{id, name?, version?, author?, description?, chapters?}`: writes `workspace/exports/<id>[-<version>].dremod`. `{file, size, manifest}` |
+| GET | `/api/exports`, `/api/exports/{file}` | exported packages; download one |
+| GET | `/api/loader` | `{mods:[{id, enabled, manifest}], chapters:[{id, state: original/modded/game_updated, backup, applied_mods, wanted_mods, pending}], save_dir, utmt_cli}` |
+| POST | `/api/loader/mods?name=&chapter=` | body: a `.dremod` file or an `.xdelta` patch. Installs it (same id: replaces). xdelta: id from `name`, `chapter` optional |
+| PUT | `/api/loader/mods` | body `[{id, enabled}]`: load order and enabled flags (each installed mod once) |
+| DELETE | `/api/loader/mods/{id}` | uninstall (Apply takes it out of the game) |
+| GET | `/api/loader/mods/{id}/check` | version check per chapter: `{chapter, in_game, same_version, checked, assets:[{type, name, status}], lang}` |
+| POST | `/api/loader/apply` | `202 {job}`: puts the enabled mods into the game (see above) |
+| POST | `/api/loader/restore` | puts the original game files back: `{restored: [...]}` |
+| GET/POST | `/api/loader/saves` | save backups / make one now |
+| POST | `/api/loader/saves/{name}/restore` | makes the save folder the same as the backup (the current saves get a backup first) |
+| DELETE | `/api/loader/saves/{name}` | delete a save backup |
 
 Asset types (`{type}`): `rooms`, `objects`, `code`, `scripts`, `sprites`, `backgrounds`, `sounds`, `fonts`, `shaders`,
 `paths`, `sequences`, `animcurves`. The `data` JSON is the UTMT project format, so every field that UTMT can import can be changed.
@@ -191,7 +245,7 @@ Code reads (`GET .../assets/code/{name}`) also return `rev`.
 ```sh
 cd server
 cargo test                                         # unit tests
-DRE_TEST_UTMT=/path/to/UndertaleModCli cargo test  # plus the end-to-end test: extract, edit, install a pattern and the hot reload object, build, verify
+DRE_TEST_UTMT=/path/to/UndertaleModCli cargo test  # plus the end-to-end test: extract, edit, install a pattern, build, export a .dremod, apply it to the game, restore
 cd .. && node --test web/tests/*.test.mjs          # battle simulator and room preview rules
 ```
 

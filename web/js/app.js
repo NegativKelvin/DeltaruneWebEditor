@@ -28,6 +28,8 @@ const views = {
   saves: () => import('./views/saves.js'),
   live: () => import('./views/live.js'),
   conflicts: () => import('./views/conflicts.js'),
+  mods: () => import('./views/mods.js'),
+  export: () => import('./views/export.js'),
 };
 
 let dirtyCheck = null;
@@ -55,6 +57,7 @@ function parseHash() {
 function route() {
   const { parts, query } = parseHash();
   if (!parts.length) return { view: 'home', query };
+  if (parts[0] === 'mods' || parts[0] === 'export') return { view: parts[0], query };
   const [ch, section, a, b] = parts;
   if (!section) return { view: 'overview', ch, query };
   if (section === 'assets') return { view: 'assets', ch, type: a, name: b, query };
@@ -99,7 +102,7 @@ function navLink(href, label, extra) {
 
 function renderNav() {
   const nav = clear(document.getElementById('nav'));
-  nav.append(navLink('#/', 'Setup'));
+  nav.append(navLink('#/', 'Setup'), navLink('#/mods', 'Mods and backups'), navLink('#/export', 'Export mod'));
   if (!state.ch) return;
   const c = `#/${encodeURIComponent(state.ch)}`;
   add(nav,

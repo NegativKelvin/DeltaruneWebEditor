@@ -32,6 +32,7 @@ export const api = {
   post: (p, body) => call('POST', p, body),
   del: (p) => call('DELETE', p),
   putRaw: (p, blob) => call('PUT', p, undefined, blob),
+  postRaw: (p, blob) => call('POST', p, undefined, blob),
 };
 
 /** Builds URL query strings and skips empty values. */
@@ -86,6 +87,12 @@ export function chapterApi(ch) {
     liveUninstall: () => api.del(`${base}/live`),
     mods: () => api.get(`${base}/mods`),
     conflicts: (body) => api.post(`${base}/conflicts`, body),
+    versionCheck: () => api.get(`${base}/version-check`),
+    acceptVersion: (type, name) => api.post(`${base}/version-check/accept`, { type, name }),
+    langIndex: () => api.get(`${base}/lang`),
+    lang: (file) => api.get(`${base}/lang/${enc(file)}`),
+    putLang: (file, changes) => api.put(`${base}/lang/${enc(file)}`, changes),
+    clearLang: (file) => api.del(`${base}/lang/${enc(file)}`),
   };
 }
 
