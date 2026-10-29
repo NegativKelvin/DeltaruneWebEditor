@@ -4,7 +4,7 @@ A modding tool for Deltarune that runs in a webpage. A local Rust server (`serve
 [UndertaleModTool](https://github.com/UnderminersTeam/UndertaleModTool) CLI to decompile each chapter,
 serves every asset to the webpage (`web/`), stores edits, and builds a patched `data.win`.
 
-Status: steps 1 to 5 are done: backend, editors, room preview and battle box, mod packages and loader, and creation tools (wizards, visual cutscene editor, text tools). One-click test launch comes later.
+Status: steps 1 to 6 are done: backend, editors, room preview and battle box, mod packages and loader, creation tools (wizards, visual cutscene editor, text tools), and game state and live tools. One-click test launch comes later.
 
 ## Download and run (no other downloads)
 
