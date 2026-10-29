@@ -157,6 +157,16 @@ async fn extract_edit_build_roundtrip() {
     assert_eq!(st, StatusCode::OK, "{inst:#}");
     assert_eq!(inst["object"], "obj_dre_wave_t1");
 
+    // Hot reload object (the build compiles its GML) with the talk object as host.
+    let (st, live) = call(
+        &app,
+        "POST",
+        "/api/chapters/chapter1/live",
+        Some(json!({ "host": "gml_Object_obj_talk_Create_0" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{live:#}");
+
     let (_, j) = call(&app, "POST", "/api/chapters/chapter1/build", None).await;
     let job = wait_job(&app, j["job"].as_u64().unwrap()).await;
     assert_eq!(job["status"], "succeeded", "{job:#}");
@@ -179,6 +189,14 @@ async fn extract_edit_build_roundtrip() {
     assert_eq!(wave["Events"].as_array().unwrap().len(), 2, "{wave:#}");
     let step = std::fs::read_to_string(check.join("p/code/gml_Object_obj_dre_wave_t1_Step_0.gml")).unwrap();
     assert!(step.contains("instance_create") && step.contains("dre_t"), "{step}");
+    let live: Value = serde_json::from_slice(&std::fs::read(check.join("p/objects/obj_dre_live.json")).unwrap()).unwrap();
+    assert_eq!(live["Persistent"], true, "{live:#}");
+    let live_step = std::fs::read_to_string(check.join("p/code/gml_Object_obj_dre_live_Step_0.gml")).unwrap();
+    assert!(
+        live_step.contains("sprite_replace") && live_step.contains("dre_live_seq"),
+        "{live_step}"
+    );
+    assert!(gml.contains("obj_dre_live"), "{gml}");
 
     // Mod package: export, install it in the loader, apply it to the game, restore.
     let key = "obj_talk_slash_Create_0_gml_2_0";

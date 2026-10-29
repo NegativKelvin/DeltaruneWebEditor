@@ -77,6 +77,16 @@ export function chapterApi(ch) {
     cutscenes: (q) => api.get(`${base}/cutscenes${qs({ q })}`),
     cutscene: (code) => api.get(`${base}/cutscenes/${enc(code)}`),
     enemies: () => api.get(`${base}/enemies`),
+    flags: (params = {}) => api.get(`${base}/flags${qs(params)}`),
+    flagRefs: (name, index) => api.get(`${base}/flags/refs${qs({ name, index })}`),
+    flagNotes: () => api.get(`${base}/flag-notes`),
+    putFlagNotes: (notes) => api.put(`${base}/flag-notes`, notes),
+    saveLayout: () => api.get(`${base}/save-layout`),
+    liveStatus: () => api.get(`${base}/live`),
+    liveInstall: (host) => api.post(`${base}/live`, host ? { host } : {}),
+    liveUninstall: () => api.del(`${base}/live`),
+    mods: () => api.get(`${base}/mods`),
+    conflicts: (body) => api.post(`${base}/conflicts`, body),
     versionCheck: () => api.get(`${base}/version-check`),
     acceptVersion: (type, name) => api.post(`${base}/version-check/accept`, { type, name }),
     langIndex: () => api.get(`${base}/lang`),
@@ -85,6 +95,14 @@ export function chapterApi(ch) {
     clearLang: (file) => api.del(`${base}/lang/${enc(file)}`),
   };
 }
+
+/** Hot reload: sends commands to the running game. cmds: [{op, args}]. */
+export const live = {
+  status: () => api.get('/api/live'),
+  send: (commands) => api.post('/api/live/commands', { commands }),
+  flags: () => api.get('/api/live/flags'),
+  sprite: (name, png, frames, xo, yo) => call('POST', `/api/live/sprite/${enc(name)}${qs({ frames, xo, yo })}`, undefined, png),
+};
 
 /** Waits for a job to end. `onUpdate` gets each poll result. */
 export async function waitJob(id, onUpdate) {

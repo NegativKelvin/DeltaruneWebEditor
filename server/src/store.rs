@@ -182,7 +182,7 @@ impl ChapterStore {
     }
 
     /// Maps asset name -> JSON path for one type in one project dir.
-    fn scan(project: &Path, ty: &AssetType) -> BTreeMap<String, PathBuf> {
+    pub fn scan(project: &Path, ty: &AssetType) -> BTreeMap<String, PathBuf> {
         let dir = project.join(ty.slug);
         let depth = if ty.individual_dir { 2 } else { 1 };
         WalkDir::new(&dir)
@@ -221,7 +221,7 @@ impl ChapterStore {
     }
 
     /// Path of the asset JSON relative to a project dir.
-    fn rel_json(ty: &AssetType, name: &str) -> PathBuf {
+    pub fn rel_json(ty: &AssetType, name: &str) -> PathBuf {
         if ty.individual_dir {
             PathBuf::from(ty.slug).join(name).join(format!("{name}.json"))
         } else {

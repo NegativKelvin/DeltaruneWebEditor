@@ -673,7 +673,7 @@ fn is_wave_event(e: &Value) -> bool {
 
 /// A new object with every field that UTMT import reads (it fails on a missing `PhysicsVertices`).
 /// Physics values are the GameMaker defaults.
-fn new_object() -> Value {
+pub(crate) fn new_object() -> Value {
     json!({
         "$type": "GameObject",
         "Sprite": null,
