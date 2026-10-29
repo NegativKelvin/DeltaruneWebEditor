@@ -22,32 +22,42 @@ export async function render(main, ctx) {
 
   function replaceTab(el) {
     const v = { find: '', replace: '', regex: false, ignore_case: false, code: '', speaker: '' };
+    const langs = new Set();
+    const langBox = h('div', { class: 'row' });
+    const body = (dry) => ({ ...v, langs: [...langs], dry_run: dry });
+    attempt(() => capi.textCheck({ offset: 0, limit: 0 })).then((r) => {
+      for (const l of r ? ['en', ...r.languages] : []) {
+        langBox.append(h('label', { class: 'field check' }, h('input', { type: 'checkbox', onchange: (e) => { if (e.target.checked) langs.add(l); else langs.delete(l); } }), h('span', null, l)));
+      }
+    });
     const inp = (k, ph, w = 240) => h('input', { type: 'text', placeholder: ph, style: { width: `${w}px` }, oninput: (e) => { v[k] = e.target.value; } });
     const chk = (k, label) => h('label', { class: 'field check' }, h('input', { type: 'checkbox', onchange: (e) => { v[k] = e.target.checked; } }), h('span', null, label));
     const out = h('div');
     const run = async (dry) => {
       if (!v.find) { toast('Give the text to find.', 'error'); return; }
       if (!dry) {
-        const pre = await attempt(() => capi.textReplace({ ...v, dry_run: true }));
+        const pre = await attempt(() => capi.textReplace(body(true)));
         if (!pre) return;
         if (!pre.changes.length) { toast('No line matches.'); return; }
-        if (!(await confirmDialog(`Change ${pre.changes.length} lines in ${pre.codes} code entries?`, 'Replace'))) return;
+        if (!(await confirmDialog(`Change ${pre.changes.length} texts (${pre.codes} code entries)?`, 'Replace'))) return;
       }
-      const r = await attempt(() => capi.textReplace({ ...v, dry_run: dry }));
+      const r = await attempt(() => capi.textReplace(body(dry)));
       if (!r) return;
       const failed = r.failed?.length ? h('div', { class: 'error-box' }, r.failed.map((f) => h('div', null, `${f.code}: ${f.error}`))) : null;
-      out.replaceChildren(h('p', null, r.applied ? `Changed ${r.changes.length} lines.` : `${r.changes.length} lines in ${r.codes} code entries will change (nothing written yet).`), failed,
-        h('table', null, h('tr', null, h('th', null, 'Where'), h('th', null, 'Before'), h('th', null, 'After'), h('th', null, 'Preview')),
-          r.changes.slice(0, 500).map((it) => h('tr', null, h('td', null, where(it), h('div', { class: 'dim small' }, it.func)),
-            h('td', { class: 'mono small' }, it.before), h('td', { class: 'mono small' }, it.after), h('td', null, textPreview(it.after))))),
+      out.replaceChildren(h('p', null, r.applied ? `Changed ${r.changes.length} texts.` : `${r.changes.length} texts will change, ${r.codes} code entries (nothing written yet).`), failed,
+        h('table', null, h('tr', null, h('th', null, 'Where'), h('th', null, 'Lang'), h('th', null, 'Before'), h('th', null, 'After'), h('th', null, 'Preview')),
+          r.changes.slice(0, 500).map((it) => h('tr', null, h('td', null, where(it), h('div', { class: 'dim small' }, it.func, it.key ? ` · ${it.key}` : '')),
+            h('td', null, it.lang || 'en'), h('td', { class: 'mono small' }, it.before), h('td', { class: 'mono small' }, it.after), h('td', null, textPreview(it.after))))),
         r.changes.length > 500 ? h('p', { class: 'dim' }, `First 500 of ${r.changes.length} shown.`) : null);
     };
     el.append(h('div', { class: 'card' },
-      h('p', { class: 'dim small' }, 'Changes the text of every dialogue line with a plain string (GML). Only the string literal changes. Translations in lang/*.json are not changed. ',
+      h('p', { class: 'dim small' }, 'English: changes the text of every dialogue line with a plain string (GML); only the string literal changes. ',
+        'Other languages: changes the translations of the keys; the changes go to the workspace lang store, the game files do not change. ',
         'Regular expressions: Rust regex syntax, $1 in the replacement.'),
       h('div', { class: 'row' }, inp('find', 'Find'), inp('replace', 'Replace with'), chk('regex', 'Regular expression'), chk('ignore_case', 'Ignore case')),
       h('div', { class: 'row', style: { marginTop: '6px' } }, inp('code', 'Only code entries with this name part', 280), inp('speaker', 'Only this speaker', 160),
-        h('button', { onclick: () => run(true) }, 'Preview'), h('button', { class: 'primary', onclick: () => run(false) }, 'Replace all'))), out);
+        h('button', { onclick: () => run(true) }, 'Preview'), h('button', { class: 'primary', onclick: () => run(false) }, 'Replace all')),
+      h('div', { class: 'row', style: { marginTop: '6px' } }, h('span', { class: 'dim small' }, 'Languages (none: English):'), langBox)), out);
   }
 
   function checkTab(el) {

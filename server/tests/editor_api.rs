@@ -521,3 +521,43 @@ async fn text_check_and_replace() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn translations_edit_and_replace() {
+    let (t, app) = setup();
+    let lang = t.path().join("game/chapter1_windows/lang");
+    std::fs::create_dir_all(&lang).unwrap();
+    std::fs::write(lang.join("lang_ja.json"), r#"{"k_1":"* こんにちは。/%"}"#).unwrap();
+    let (_, dlg) = call(&app, "GET", "/api/chapters/chapter1/dialogue", None).await;
+    assert_eq!(dlg["lang_files"], json!({ "ja": "lang_ja.json" }));
+    assert_eq!(dlg["items"][0]["translations_changed"], json!([]));
+    // A mod change of the key shows in the dialogue list and the check.
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/api/chapters/chapter1/lang/lang_ja.json",
+        Some(json!({ "k_1": "* やあ。/%" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, dlg) = call(&app, "GET", "/api/chapters/chapter1/dialogue", None).await;
+    assert_eq!(dlg["items"][0]["translations"]["ja"], "* やあ。/%");
+    assert_eq!(dlg["items"][0]["translations_changed"], json!(["ja"]));
+    // Replace in the translation only: the GML text stays.
+    let rep = json!({ "find": "やあ", "replace": "おはよう", "langs": ["ja"] });
+    let (st, r) = call(&app, "POST", "/api/chapters/chapter1/text/replace", Some(rep)).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["changes"][0]["lang"], "ja");
+    let (_, ov) = call(&app, "GET", "/api/chapters/chapter1/lang/lang_ja.json", None).await;
+    assert_eq!(ov, json!({ "k_1": "* おはよう。/%" }));
+    let (_, dlg) = call(&app, "GET", "/api/chapters/chapter1/dialogue", None).await;
+    assert_eq!(dlg["items"][0]["text"], "* Hi./%");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/api/chapters/chapter1/text/replace",
+        Some(json!({ "find": "a", "langs": ["xx"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}

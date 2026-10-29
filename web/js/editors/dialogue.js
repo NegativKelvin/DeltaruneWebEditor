@@ -20,7 +20,13 @@ export async function render(main, ctx) {
   let offset = 0;
   let data = null;
   const edits = new Map(); // row index -> new text
-  setDirtyCheck(() => edits.size > 0);
+  const trEdits = new Map(); // `${lang}\n${key}` -> {lang, key, text}
+  const dirty = () => edits.size + trEdits.size;
+  const showDirty = () => {
+    saveAll.disabled = dirty() === 0;
+    saveAll.textContent = dirty() ? `Save changes (${dirty()})` : 'Save changes';
+  };
+  setDirtyCheck(() => dirty() > 0);
   let font = null;
   const fontSel = fontSelect(capi, (f) => { font = f && f.data.Glyphs?.length ? f : null; if (data) redrawPreviews(); });
   const previews = [];
@@ -28,7 +34,7 @@ export async function render(main, ctx) {
 
   add(page,
     h('h2', null, 'Dialogue'),
-    h('p', { class: 'dim small' }, 'Text lines from all code. English text is in the GML; other languages come from lang/*.json in the chapter folder (read-only here). ',
+    h('p', { class: 'dim small' }, 'Text lines from all code. English text is in the GML; other languages come from lang/*.json in the chapter folder. Translation changes are kept in the workspace (lang store) and go into the mod. ',
       'Codes: & or newline = new line, / = wait for key, % = close box, ^1 = pause, \\E1 = face, \\cY = colour.'),
     h('div', { class: 'row' }, q, code, h('button', { onclick: () => { offset = 0; load(); } }, 'Find'), info, h('div', { class: 'grow' }),
       fontSel, h('a', { class: 'button', href: `#/${encodeURIComponent(ch)}/text` }, 'Text tools'), saveAll),
@@ -37,9 +43,10 @@ export async function render(main, ctx) {
   code.addEventListener('change', () => { offset = 0; load(); });
 
   async function load() {
-    if (edits.size && !(await confirmDialog('Discard unsaved dialogue changes?', 'Discard'))) return;
+    if (dirty() && !(await confirmDialog('Discard unsaved dialogue changes?', 'Discard'))) return;
     edits.clear();
-    saveAll.disabled = true;
+    trEdits.clear();
+    showDirty();
     const r = await attempt(() => capi.dialogue({ q: q.value, code: code.value, offset, limit: PAGE }));
     if (!r) return;
     data = r;
@@ -72,8 +79,7 @@ export async function render(main, ctx) {
         if (input.value === it.text) edits.delete(i); else edits.set(i, input.value);
         input.style.borderColor = edits.has(i) ? 'var(--accent)' : '';
         show(input.value);
-        saveAll.disabled = edits.size === 0;
-        saveAll.textContent = edits.size ? `Save changes (${edits.size})` : 'Save changes';
+        showDirty();
       });
     } else {
       input = h('span', { class: 'dim small' }, it.key ? `Key only: ${it.key}` : '(not a plain string)');
@@ -88,10 +94,52 @@ export async function render(main, ctx) {
       h('td', null, it.speaker || h('span', { class: 'dim' }, '-')),
       h('td', null, input, input instanceof HTMLTextAreaElement ? codeButtons(capi, input) : null, len, it.key ? h('div', { class: 'dim small mono' }, it.key) : null),
       h('td', null, pv),
-      langs.length ? h('td', { class: 'small' }, langs.map((l) => (it.translations[l] ? h('div', null, h('span', { class: 'dim' }, `${l}: `), it.translations[l]) : null))) : null);
+      langs.length ? h('td', { class: 'small' }, langs.map((l) => trCell(it, l))) : null);
+  }
+
+  // One translation of a line with a key: editable; a changed text can go back to the game text.
+  function trCell(it, l) {
+    const old = it.translations[l];
+    if (!it.key) return old ? h('div', null, h('span', { class: 'dim' }, `${l}: `), old) : null;
+    const id = `${l}\n${it.key}`;
+    const ta = h('textarea', { class: 'dlg-text', rows: 1, value: old ?? '', placeholder: '(missing)' });
+    const len = h('div');
+    const show = () => len.replaceChildren(ta.value ? lengthInfo(ta.value, hasFace(ta.value, it.speaker), DEFAULT_LIMITS, null) : '');
+    ta.addEventListener('input', () => {
+      if (ta.value === (old ?? '')) trEdits.delete(id); else trEdits.set(id, { lang: l, key: it.key, text: ta.value });
+      ta.style.borderColor = trEdits.has(id) ? 'var(--accent)' : '';
+      show();
+      showDirty();
+    });
+    show();
+    const changed = (it.translations_changed || []).includes(l);
+    const revert = changed ? h('button', { class: 'small', title: 'Remove the mod change: use the game text again', onclick: async () => {
+      if (!(await confirmDialog(`Use the game text for ${l} ${it.key} again?`, 'Revert'))) return;
+      if (!(await attempt(() => capi.putLang(data.lang_files[l], { [it.key]: null })))) return;
+      toast('Reverted', 'ok');
+      trEdits.delete(id);
+      showDirty();
+      load();
+    } }, 'revert') : null;
+    return h('div', { class: 'dlg-tr' }, h('span', { class: 'dim' }, `${l}: `), changed ? h('span', { class: 'badge mod' }, 'changed') : null, revert, ta, len);
   }
 
   async function save() {
+    // Translations: one write per lang file. They do not change the GML, so they go first.
+    const byFile = new Map();
+    for (const [id, e] of trEdits) {
+      const file = data.lang_files[e.lang];
+      if (!byFile.has(file)) byFile.set(file, { changes: {}, ids: [] });
+      byFile.get(file).changes[e.key] = e.text;
+      byFile.get(file).ids.push(id);
+    }
+    let tn = 0;
+    for (const [file, p] of byFile) {
+      if (!(await attempt(() => capi.putLang(file, p.changes)))) continue;
+      tn += p.ids.length;
+      for (const id of p.ids) trEdits.delete(id);
+    }
+    if (tn) toast(`Saved ${tn} translations`, 'ok');
     // Group by code entry: one patch per code.
     const byCode = new Map();
     for (const [i, text] of edits) {
@@ -107,13 +155,13 @@ export async function render(main, ctx) {
       saved++;
       for (const i of p.rows) edits.delete(i);
     }
-    if (edits.size) {
+    if (dirty()) {
       // Keep the lines that were not saved, so the text is not lost. Saved rows now have a new rev: reload before you change them again.
-      toast(`Saved ${n} lines in ${saved} code entries. ${edits.size} lines are not saved.`, 'error');
-      saveAll.textContent = `Save changes (${edits.size})`;
+      toast(`Saved ${n} lines in ${saved} code entries and ${tn} translations. ${dirty()} changes are not saved.`, 'error');
+      showDirty();
       return;
     }
-    toast(`Saved ${n} lines in ${byCode.size} code entries`, 'ok');
+    if (byCode.size) toast(`Saved ${n} lines in ${byCode.size} code entries`, 'ok');
     load();
   }
 

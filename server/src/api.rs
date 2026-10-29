@@ -1,6 +1,6 @@
 //! HTTP API for the webpage. All routes are under `/api`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -68,6 +68,9 @@ pub struct AppState {
     /// Held while an asset is changed, so a patch cannot check its rev while another write runs.
     write_lock: Mutex<()>,
 }
+
+/// Language -> lang file name (`ja` -> `lang_ja.json`).
+type LangFiles = BTreeMap<String, String>;
 
 /// Code entries with `c_*` steps: (name, step count).
 type CutsceneList = Vec<(String, usize)>;
@@ -231,6 +234,36 @@ impl AppState {
         let l = Arc::new(dialogue::load_lang(dir));
         self.lang_cache.lock().unwrap().insert(dir.to_path_buf(), (stamp, l.clone()));
         l
+    }
+
+    /// Translations as the mod has them: the game `lang/*.json` with the changed keys of `workspace/<ch>/lang/`.
+    /// Also returns language -> file name, and language -> changed keys.
+    fn langs_modded(
+        &self,
+        chapter: &Chapter,
+        store: &ChapterStore,
+    ) -> (Arc<dialogue::Langs>, LangFiles, BTreeMap<String, BTreeSet<String>>) {
+        let base = self.langs(&chapter.dir);
+        let lang_of = |f: &str| f.trim_end_matches(".json").trim_start_matches("lang_").to_owned();
+        let mut files: LangFiles = langmod::game_files(&chapter.dir).into_iter().map(|f| (lang_of(&f), f)).collect();
+        let mut changed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let list = langmod::list(store);
+        if list.is_empty() {
+            return (base, files, changed);
+        }
+        let mut l = (*base).clone();
+        for f in list.keys() {
+            let lang = lang_of(f);
+            files.entry(lang.clone()).or_insert_with(|| f.clone());
+            let table = l.entry(lang.clone()).or_default();
+            for (k, v) in langmod::read(store, f).unwrap_or_default() {
+                if let Value::String(t) = v {
+                    table.insert(k.clone(), t);
+                    changed.entry(lang.clone()).or_default().insert(k);
+                }
+            }
+        }
+        (Arc::new(l), files, changed)
     }
 
     fn dialogue(&self, chapter: &str, store: &ChapterStore) -> Arc<Vec<DialogueLine>> {
@@ -768,7 +801,7 @@ async fn text_check(State(s): St, Path(ch): Path<String>, Query(q): Query<TextCh
     let st = s.clone();
     blocking(move || {
         let lines = st.dialogue(&chapter.id, &store);
-        let langs = st.langs(&chapter.dir);
+        let (langs, _, _) = st.langs_modded(&chapter, &store);
         let only: Vec<String> = q
             .langs
             .unwrap_or_default()
@@ -794,15 +827,48 @@ async fn text_replace(State(s): St, Path(ch): Path<String>, Json(r): Json<text::
     let st = s.clone();
     let out = blocking(move || {
         let lines = st.dialogue(&chapter.id, &store);
-        let planned = r.changes(&lines)?;
+        let (langs, files, _) = st.langs_modded(&chapter, &store);
+        if let Some(l) = r.langs.iter().find(|l| *l != "en" && !files.contains_key(*l)) {
+            return Err(Error::BadRequest(format!("no lang file for language '{l}'")));
+        }
+        let planned = r.all_changes(&lines, &langs)?;
         if r.dry_run {
-            return Ok(json!({ "applied": false, "changes": planned, "codes": planned.iter().map(|c| &c.code).collect::<std::collections::BTreeSet<_>>().len() }));
+            let codes = planned
+                .iter()
+                .filter(|c| c.lang.is_none())
+                .map(|c| &c.code)
+                .collect::<BTreeSet<_>>()
+                .len();
+            return Ok(json!({ "applied": false, "changes": planned, "codes": codes }));
         }
         let _w = st.write_lock();
-        let codes: std::collections::BTreeSet<String> = planned.iter().map(|c| c.code.clone()).collect();
-        let code_ty = store::asset_type("code")?;
         let mut done = Vec::new();
         let mut failed = Vec::new();
+        // Translations: one merge per lang file (changed keys only).
+        let mut per_file: BTreeMap<&str, serde_json::Map<String, Value>> = BTreeMap::new();
+        for c in planned.iter().filter(|c| c.lang.is_some()) {
+            let (Some(lang), Some(key)) = (&c.lang, &c.key) else { continue };
+            per_file
+                .entry(files[lang].as_str())
+                .or_default()
+                .insert(key.clone(), Value::String(c.after.clone()));
+        }
+        for (file, changes) in per_file {
+            match langmod::merge(&store, file, changes) {
+                Ok(_) => done.extend(
+                    planned
+                        .iter()
+                        .filter(|c| c.lang.as_ref().is_some_and(|l| files[l] == file))
+                        .cloned(),
+                ),
+                Err(e) => failed.push(json!({ "code": file, "error": e.to_string() })),
+            }
+        }
+        if !(r.langs.is_empty() || r.langs.iter().any(|l| l == "en")) {
+            return Ok(json!({ "applied": true, "changes": done, "failed": failed }));
+        }
+        let codes: BTreeSet<String> = planned.iter().filter(|c| c.lang.is_none()).map(|c| c.code.clone()).collect();
+        let code_ty = store::asset_type("code")?;
         for name in codes {
             let src = store.read(code_ty, &name)?["source"].as_str().unwrap_or_default().to_owned();
             let changes = r.changes(&dialogue::scan_source(&name, &src))?;
@@ -851,7 +917,7 @@ async fn get_dialogue(State(s): St, Path(ch): Path<String>, Query(q): Query<List
     let st = s.clone();
     blocking(move || {
         let lines = st.dialogue(&chapter.id, &store);
-        let langs = st.langs(&chapter.dir);
+        let (langs, files, changed) = st.langs_modded(&chapter, &store);
         let needle = q.q.map(|x| x.to_lowercase());
         let matches = |l: &DialogueLine| {
             q.code.as_ref().is_none_or(|c| &l.code == c)
@@ -881,11 +947,18 @@ async fn get_dialogue(State(s): St, Path(ch): Path<String>, Query(q): Query<List
                     .unwrap_or_default();
                 let mut v = serde_json::to_value(l).unwrap();
                 v["translations"] = Value::Object(tr);
+                // Languages whose text for this key is a mod change (workspace/<ch>/lang/).
+                v["translations_changed"] = json!(
+                    l.key
+                        .as_ref()
+                        .map(|k| changed.iter().filter(|(_, keys)| keys.contains(k)).map(|(lang, _)| lang.clone()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                );
                 v
             })
             .collect();
         Ok(Json(
-            json!({ "total": total, "offset": q.offset, "languages": langs.keys().collect::<Vec<_>>(), "items": items }),
+            json!({ "total": total, "offset": q.offset, "languages": langs.keys().collect::<Vec<_>>(), "lang_files": files, "items": items }),
         ))
     })
     .await

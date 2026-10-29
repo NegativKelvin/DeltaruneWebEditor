@@ -59,8 +59,8 @@ and a WebAssembly build adds a toolchain for no gain here, so all parsing stays 
 | Setup | Set the game folder and UndertaleModCli path. Extract each chapter. |
 | Overview and build | Asset counts, list of changes (revert each), build `data.win` with the log. |
 | Rooms and triggers | Draws background colour, backgrounds, tile layers, asset layers, legacy tiles, and instances (old and GMS2 layer rooms). Select, drag, nudge, add, duplicate, delete instances. Paint and erase tiles. Edit instance creation code (trigger settings) and room creation code inline. Triggers list: door, marker, event, and invisible objects, and instances with creation code. Layer, view, and room properties. Undo/redo. |
-| Dialogue | All text lines from GML with speaker, key, translations, and a text box preview (`\cY` colours, `^1` pauses, `/` `%`). Edit text: only the string literal changes. Code buttons (`&`, `^1`, `/`, `%`, colours, face picker), line widths under each line (red when over the limit), and game font preview. |
-| Text tools | **Find and replace** in all dialogue text (plain or regex with `$1`; filter by code name or speaker; preview first). **Line length check**: lines too long for the box and boxes with too many lines, for English and each `lang/*.json` language, in characters (wide characters count 2) or in pixels with a game font; translation coverage (missing keys, same as English). **Font and faces**: draw text with a game font; pick a face sprite frame to get its `\E` code. |
+| Dialogue | All text lines from GML with speaker, key, translations, and a text box preview (`\cY` colours, `^1` pauses, `/` `%`). Edit text: only the string literal changes. Code buttons (`&`, `^1`, `/`, `%`, colours, face picker), line widths under each line (red when over the limit), and game font preview. Edit translations of keyed lines; changes go to the workspace lang store (badge `changed`, **revert** uses the game text again). |
+| Text tools | **Find and replace** in all dialogue text (plain or regex with `$1`; filter by code name or speaker; select languages: English changes GML, other languages change the lang store; preview first). **Line length check**: lines too long for the box and boxes with too many lines, for English and each `lang/*.json` language, in characters (wide characters count 2) or in pixels with a game font; translation coverage (missing keys, same as English). **Font and faces**: draw text with a game font; pick a face sprite frame to get its `\E` code. |
 | Templates and wizards | Make all assets and code for a new **NPC** (talk text, speaker, sprite, put in a room), **shop** (up to 3 items, gold check, `scr_itemget`), **enemy** (object, a new case in the `global.monster*` stats switch, optional encounter case, bullet pattern wave on its turn), **room** (layout from a template room, markers, doors to other rooms, creation code), and **cutscene trigger** (touch, talk, or room start; run once with a `global.flag`). **Preview** lists every asset and its GML; **Create** writes them into the mod (all or nothing; a new asset must not exist). |
 | Cutscenes | Code entries with `c_*` calls. **State graph**: each `if (con == N)` part is a node, `con = M` / `con++` gives an arrow; click a node to go to its steps. **Timeline** per block: lanes per actor, text, camera, sound; only wait steps (`c_wait`, `*_wait`, `c_talk_wait`) move time; Play shows actor moves and the text box. **Steps**: typed fields (direction, actor, frames, text with preview, sprite/sound/object lists), drag to reorder (also between blocks), add from a menu, paste GML. **+ Add part** adds a new `if (con == N)` part. Saving: the server checks every argument (one GML expression: brackets, strings, no `,` `;` or comments) and changes only the edited blocks. |
 | Sprites | Pixel editor (pencil, eraser, fill, colour picker, flip), frames (add, copy, delete, reorder, import PNG or strip, export strip), resize, origin, bounding box, collision kind, animation preview. Automatic bounding box and collision masks are made on save. |
@@ -154,7 +154,7 @@ Known limits of step 5:
 - The shop is a simple shopkeeper (one choice box), not a full Deltarune shop room. The choice box uses `\C2` to `\C4`.
 - Wizard doors are own objects (`obj_dre_doorA` ...) without a fade. A new room is not in the room order (`room_goto` works).
 - Line limits (33 characters, 26 with a face, 3 lines) are estimates. Face codes after `\E9` (`\EA` ...) are a guess.
-- Find and replace changes the GML text only. Translation edits are not part of step 5.
+- Find and replace on translations changes only keys found in GML dialogue lines.
 - The cutscene timeline is an estimate: text waits show as 45 steps, and actor moves only use `c_walk`, `c_setxy`, `c_addxy`.
 
 ## How data flows
@@ -203,7 +203,7 @@ All responses are JSON. Errors: `{"error": "..."}` with status 400/404/409/500.
 | PUT | `/api/chapters/{ch}/cutscenes/{code}` | body `{rev, blocks:[{start, end, indent, steps:[{func, args}]}], sections:[{con, next?, steps}]}`: writes changed blocks and new `if (con == N)` parts. `400` for a bad step, `409` if `rev` is old |
 | POST | `/api/chapters/{ch}/wizards/{kind}?dry_run=true` | `kind`: `npc`, `shop`, `enemy`, `room`, `cutscene`; body: its parameters (see `server/src/wizards.rs`). `{applied, writes:[{type, name, new, data?, source?}], notes}`. Without `dry_run` it writes all (`409` if a new asset exists) |
 | GET | `/api/chapters/{ch}/text/check?chars=&face_chars=&lines=&font=&px=&face_px=&langs=` | texts over the box limits: `{total, items:[{code, line, lang, text, problems}], coverage:{lang:{keys, missing, same, missing_keys}}}` |
-| POST | `/api/chapters/{ch}/text/replace` | body `{find, replace, regex?, ignore_case?, code?, speaker?, dry_run?}`: `{applied, changes:[{code, line, func, before, after}], failed}` |
+| POST | `/api/chapters/{ch}/text/replace` | body `{find, replace, regex?, ignore_case?, code?, speaker?, langs?, dry_run?}` (`langs`: `en` and/or languages; empty: `en`): `{applied, changes:[{code, line, func, before, after, lang?, key?}], codes, failed}` |
 | GET | `/api/chapters/{ch}/enemies` | `global.monster*[i] = v` and `global.battlemsg[i] = v` assignments: `[{code, case, index, rev, fields:{name: {expr, start, end, line}}}]` |
 | GET | `/api/chapters/{ch}/patterns` | saved bullet patterns: `[{name, duration, emitters, object}]` |
 | GET/PUT/DELETE | `/api/chapters/{ch}/patterns/{name}` | one pattern (JSON, missing fields get defaults). Kept in `workspace/{ch}/patterns/`, not in the mod. `DELETE ...?uninstall=true` also removes the installed wave object and its code from `mod/` |
@@ -249,8 +249,8 @@ Asset types (`{type}`): `rooms`, `objects`, `code`, `scripts`, `sprites`, `backg
 
 The server scans all GML for `msgsetloc`, `msgnextloc`, `msgsetsubloc`, `msgnextsubloc`, `c_msg*` variants, `stringsetloc`,
 `stringsetsubloc`, `msgset`, `msgnext`, `stringset`, and `scr_84_get_lang_string`. Each line has
-`{code, line, func, text, span, key, speaker, rev, translations}`. `speaker` comes from the last `scr_speaker`/`c_speaker` call in the same code entry.
-`translations` come from `<chapter dir>/lang/lang_*.json` (for example `ja`).
+`{code, line, func, text, span, key, speaker, rev, translations, translations_changed}`. The response also has `lang_files` (language → file name for the lang API). `speaker` comes from the last `scr_speaker`/`c_speaker` call in the same code entry.
+`translations` come from `<chapter dir>/lang/lang_*.json` (for example `ja`), with the workspace lang changes over them; `translations_changed` lists the languages with a change for the key.
 To change a line, `POST .../code/{code}/patch` with `{rev, edits:[{start: span[0], end: span[1], string: "new text"}]}`.
 Code reads (`GET .../assets/code/{name}`) also return `rev`.
 

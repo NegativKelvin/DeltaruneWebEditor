@@ -274,6 +274,10 @@ pub struct Replace {
     /// Only lines with this speaker.
     #[serde(default)]
     pub speaker: String,
+    /// Also change these translations (language names, as in `lang/lang_<name>.json`). The GML text changes only when `en` is in
+    /// the list or the list is empty.
+    #[serde(default)]
+    pub langs: Vec<String>,
     /// Return the changes, write nothing.
     #[serde(default)]
     pub dry_run: bool,
@@ -286,6 +290,11 @@ pub struct Change {
     pub func: String,
     pub before: String,
     pub after: String,
+    /// None: the GML text. Some: a translation (`lang/lang_<lang>.json`, key `key`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(skip)]
     pub span: [usize; 2],
 }
@@ -304,30 +313,68 @@ impl Replace {
     }
 
     /// The changes to `lines` (lines with an editable string literal only).
+    /// The GML text changes (lines with an editable string literal only).
     pub fn changes(&self, lines: &[DialogueLine]) -> Result<Vec<Change>> {
+        self.all_changes(lines, &Langs::new())
+    }
+
+    /// The GML text changes (when `en` is selected) and the translation changes of the selected languages.
+    /// `tr`: the translations as the mod has them now.
+    pub fn all_changes(&self, lines: &[DialogueLine], tr: &Langs) -> Result<Vec<Change>> {
         let re = self.matcher()?;
-        let mut out = Vec::new();
-        for l in lines {
-            let (Some(text), Some(span)) = (&l.text, l.span) else { continue };
-            if (!self.code.is_empty() && !l.code.contains(&self.code))
-                || (!self.speaker.is_empty() && l.speaker.as_deref() != Some(&self.speaker))
-            {
-                continue;
-            }
+        let run = |text: &str| {
             let after = if self.regex {
                 re.replace_all(text, self.replace.as_str())
             } else {
                 re.replace_all(text, regex::NoExpand(&self.replace))
             };
-            if after != *text {
+            (after != text).then(|| after.into_owned())
+        };
+        let gml_text = self.langs.is_empty() || self.langs.iter().any(|l| l == "en");
+        let mut out = Vec::new();
+        let mut seen_keys = std::collections::HashSet::new();
+        for l in lines {
+            if (!self.code.is_empty() && !l.code.contains(&self.code))
+                || (!self.speaker.is_empty() && l.speaker.as_deref() != Some(&self.speaker))
+            {
+                continue;
+            }
+            if gml_text
+                && let (Some(text), Some(span)) = (&l.text, l.span)
+                && let Some(after) = run(text)
+            {
                 out.push(Change {
                     code: l.code.clone(),
                     line: l.line,
                     func: l.func.clone(),
                     before: text.clone(),
-                    after: after.into_owned(),
+                    after,
+                    lang: None,
+                    key: None,
                     span,
                 });
+            }
+            let Some(k) = &l.key else { continue };
+            for lang in self.langs.iter().filter(|x| *x != "en") {
+                let Some(text) = tr.get(lang).and_then(|t| t.get(k)) else {
+                    continue;
+                };
+                // A key can be in more than one line: change it once.
+                if !seen_keys.insert((lang.clone(), k.clone())) {
+                    continue;
+                }
+                if let Some(after) = run(text) {
+                    out.push(Change {
+                        code: l.code.clone(),
+                        line: l.line,
+                        func: l.func.clone(),
+                        before: text.clone(),
+                        after,
+                        lang: Some(lang.clone()),
+                        key: Some(k.clone()),
+                        span: [0, 0],
+                    });
+                }
             }
         }
         Ok(out)
@@ -413,6 +460,7 @@ mod tests {
             ignore_case: true,
             code: String::new(),
             speaker: String::new(),
+            langs: vec![],
             dry_run: true,
         };
         let ch = r.changes(&lines).unwrap();
@@ -439,6 +487,33 @@ mod tests {
             .changes(&lines)
             .is_err()
         );
-        assert!(Replace { find: String::new(), ..r }.changes(&lines).is_err());
+        assert!(
+            Replace {
+                find: String::new(),
+                ..r.clone()
+            }
+            .changes(&lines)
+            .is_err()
+        );
+        // Translations: only the selected languages, each key once; no GML change without `en`.
+        let tr: Langs = BTreeMap::from([("ja".to_owned(), BTreeMap::from([("k1".to_owned(), "* Kris!".to_owned())]))]);
+        let r = Replace {
+            find: "Kris".into(),
+            replace: "K".into(),
+            regex: false,
+            langs: vec!["ja".into()],
+            ..r
+        };
+        let ch = r.all_changes(&lines, &tr).unwrap();
+        assert_eq!(ch.len(), 1);
+        assert_eq!(
+            (ch[0].lang.as_deref(), ch[0].key.as_deref(), ch[0].after.as_str()),
+            (Some("ja"), Some("k1"), "* K!")
+        );
+        let r = Replace {
+            langs: vec!["en".into(), "ja".into()],
+            ..r
+        };
+        assert_eq!(r.all_changes(&lines, &tr).unwrap().len(), 2);
     }
 }
