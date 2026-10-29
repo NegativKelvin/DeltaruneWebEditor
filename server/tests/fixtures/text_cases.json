@@ -1,0 +1,13 @@
+[
+  { "text": "* Hello^1, \\cYKris\\cW./%", "visible": [["* Hello, Kris."]], "problems": 0 },
+  { "text": "* One&* Two\n* Three/", "visible": [["* One", "* Two", "* Three"]], "problems": 0 },
+  { "text": "* A&B&C&D/%", "visible": [["* A", "B", "C", "D"]], "problems": 1 },
+  { "text": "* 50/50 chance~1/%", "visible": [["* 50/50 chance[1]"]], "problems": 0 },
+  { "text": "* This line is far too long for the box./%", "visible": [["* This line is far too long for the box."]], "problems": 1 },
+  { "text": "\\E2* A line that fits, but not with a face./%", "face": true, "visible": [["* A line that fits, but not with a face."]], "problems": 1 },
+  { "text": "* 12345678901234567890123456789012/%", "visible": [["* 12345678901234567890123456789012"]], "problems": 1 },
+  { "text": "* 1234567890123456789012345678901/%", "visible": [["* 1234567890123456789012345678901"]], "problems": 0 },
+  { "text": "* こんにちは、クリス。元気ですか？/%", "visible": [["* こんにちは、クリス。元気ですか？"]], "problems": 1 },
+  { "text": "\\C2 ", "visible": [[" "]], "problems": 0 },
+  { "text": "", "visible": [[""]], "problems": 0 }
+]
